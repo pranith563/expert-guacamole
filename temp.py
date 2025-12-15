@@ -1,258 +1,303 @@
+# apps/orchestrator/agentic_suite/graph/state.py
+
 from __future__ import annotations
 
-from typing import Any, List, Optional, Sequence
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
 
-from langchain_core.messages import (
-    AIMessage,
-    BaseMessage,
-    HumanMessage,
-    SystemMessage,
-    ToolMessage,
-)
-
-from agentic_logging import get_logger
-from agentic_suite.graph.state import GraphState
-from agentic_suite.llm.prompt_loader import load_prompt
-
-logger = get_logger("chat_agent")
+from langchain_core.messages import BaseMessage
 
 
-class ChatAgent:
+# -----------------------
+# Mode / Task literals
+# -----------------------
+
+Mode = Literal["chat", "convert", "profile", "patch_search"]
+
+TaskType = Literal[
+    "chat",
+    "convert",
+    "profile",
+    "patch_search",
+    "analysis",
+]
+
+
+# -----------------------
+# UI Context
+# -----------------------
+
+class UIContext(TypedDict, total=False):
     """
-    Chat agent node for LangGraph.
+    UI context about what the user is viewing / has selected.
+    Keep this lightweight and stable; agents use this to ground actions.
+    """
+    selected_project_id: Optional[str]
+    selected_model_id: Optional[str]
+    selected_artifact_id: Optional[str]
+    selected_experiment_id: Optional[str]
 
-    Contract:
-    - Input state["messages"] may contain:
-        - LangChain BaseMessage objects (preferred)
-        - (optionally) legacy dict messages {role, content, ...} for backward compatibility
-    - Output state["messages"] WILL contain LangChain BaseMessage objects.
+    active_pane: Optional[Literal["left", "right"]]
+    visible_files: List[str]
+    cursor_position: Optional[Dict[str, Any]]  # e.g. {"file": "...", "line": 12, "col": 4}
 
-    Tool calling:
-    - The LLM may emit tool_calls in the returned AIMessage
-    - LangGraph routing (tools_condition) should send control to ToolNode
-    - ToolNode appends ToolMessage(s) and routes back to this ChatAgent
-    - This ChatAgent then generates the final natural-language answer
 
-    RAG:
-    - If state["rag_status"] == "done", ChatAgent will inject RAG context as a SystemMessage once.
-    - If enable_rag_autorequest is True, ChatAgent may set:
-        state["rag_status"] = "requested"
-        state["rag_request"] = {...}
+# -----------------------
+# Task parameter blocks
+# -----------------------
+
+class ConvertParams(TypedDict, total=False):
+    input_model_path: str
+    input_framework: Literal["tensorflow", "pytorch", "onnx"]
+    target_runtime: Literal["tflite", "qnn", "snpe", "neuropilot"]
+    target_accelerator: Literal["cpu", "gpu", "htp", "mdla", "dsp"]
+    quantization: Optional[Literal["none", "int8", "fp16"]]
+    optimization_level: int  # e.g. 0-3
+    custom_options: Dict[str, Any]
+
+
+class ProfileParams(TypedDict, total=False):
+    model_path: str
+    device_id: Optional[str]
+    accelerator: Literal["cpu", "gpu", "htp", "mdla", "dsp"]
+    iterations: int
+    warmup_iterations: int
+    collect_memory: bool
+    collect_power: bool
+    custom_options: Dict[str, Any]
+
+
+class PatchSearchParams(TypedDict, total=False):
+    query: str
+    error_message: Optional[str]
+    context_model: Optional[str]
+    context_runtime: Optional[str]
+    max_results: int
+    sources: List[Literal["docs", "confluence", "experiments", "modelhub"]]
+
+
+class AnalysisParams(TypedDict, total=False):
+    experiment_ids: List[str]
+    analysis_type: Literal["single", "comparison", "trend"]
+    metrics: List[str]  # ["latency", "memory", "power", ...]
+    comparison_baseline: Optional[str]
+
+
+# -----------------------
+# Runtime tracking
+# -----------------------
+
+class IntermediateResult(TypedDict, total=False):
+    step_name: str
+    step_index: int
+    data: Any
+    metadata: Dict[str, Any]
+
+
+class LLMPlan(TypedDict, total=False):
+    goal: str
+    steps: List[str]
+    current_step: int
+    reasoning: str
+
+
+# -----------------------
+# Legacy message dict (optional support)
+# -----------------------
+
+class MessageDict(TypedDict, total=False):
+    """
+    Legacy/compat message format. Prefer LangChain BaseMessage objects in state["messages"].
+    """
+    role: Literal["user", "assistant", "system", "tool"]
+    content: str
+    name: Optional[str]
+    tool_call_id: Optional[str]
+    tool_calls: Any
+    metadata: Dict[str, Any]
+
+
+MessageLike = Union[BaseMessage, MessageDict]
+
+
+# -----------------------
+# RAG dataclasses (kept small + serializable)
+# -----------------------
+
+@dataclass
+class RagRequest:
+    query: str
+    max_chunks: Optional[int] = None
+    sources: Optional[List[str]] = None
+    context_type: str = "general"
+
+
+@dataclass
+class RagChunk:
+    text: str
+    source: Optional[str] = None
+    doc_id: Optional[str] = None
+    score: Optional[float] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class RagResult:
+    used_query: str
+    chunks: List[RagChunk]
+    notes: Optional[str] = None
+    sources_used: Optional[List[str]] = None
+
+
+RagStatus = Literal["idle", "requested", "running", "done", "failed"]
+
+
+# -----------------------
+# Main GraphState
+# -----------------------
+
+class GraphState(TypedDict, total=False):
+    """
+    Complete session state flowing through LangGraph.
+    Keep keys consistent across API gateway, supervisor, agents, and graph wiring.
     """
 
-    def __init__(
-        self,
-        llm: Any,
-        *,
-        max_rag_iterations: int = 3,
-        enable_rag_autorequest: bool = True,
-        rag_injection_max_chunks: int = 3,
-        rag_injection_max_chars: int = 600,
-    ):
-        self.llm = llm
-        self.max_rag_iterations = max_rag_iterations
-        self.enable_rag_autorequest = enable_rag_autorequest
-        self.rag_injection_max_chunks = rag_injection_max_chunks
-        self.rag_injection_max_chars = rag_injection_max_chars
+    # Core
+    user_id: str
+    session_id: str
+    mode: Mode
+    ui_context: UIContext
+    messages: List[MessageLike]
 
-    def __call__(self, state: GraphState) -> GraphState:
-        session_id = state.get("session_id", "unknown")
-        logger.info("ChatAgent invoked", extra={"session_id": session_id})
+    # Intent / task
+    intent: Optional[str]
+    sub_intent: Optional[str]
+    active_task_type: Optional[TaskType]
+    active_task_id: Optional[str]
 
-        # 1) Normalize incoming messages to LangChain BaseMessage objects
-        messages: List[BaseMessage] = self._normalize_messages(state.get("messages") or [])
+    # Params
+    convert_params: Optional[ConvertParams]
+    profile_params: Optional[ProfileParams]
+    patch_search_params: Optional[PatchSearchParams]
+    analysis_params: Optional[AnalysisParams]
 
-        # 2) If RAG just finished, inject context ONCE, then clear rag flags
-        if state.get("rag_status") == "done":
-            rag_context = self._build_rag_context(state.get("rag_result"))
-            if rag_context:
-                messages.append(SystemMessage(content=rag_context))
+    # Experiments / tools
+    experiment_run_id: Optional[str]
+    last_error: Optional[str]
+    intermediate_results: List[IntermediateResult]
 
-            # Clear so we don't inject repeatedly
-            state["rag_status"] = "idle"
-            state["rag_result"] = None
-            state["rag_request"] = None
+    # LLM planning / response
+    llm_plan: Optional[LLMPlan]
+    llm_response_draft: Optional[str]
 
-        # 3) Load system prompt (prepend each invocation, simplest + safe)
-        system_prompt = self._load_system_prompt()
-        full_messages: List[BaseMessage] = [SystemMessage(content=system_prompt)] + messages
+    # RAG
+    rag_request: Optional[Union[RagRequest, Dict[str, Any]]]
+    rag_result: Optional[Union[RagResult, Dict[str, Any]]]
+    rag_status: RagStatus
+    rag_observations: List[str]
+    rag_iterations: int
+    max_rag_iterations: int
 
-        # 4) Call the LLM
-        try:
-            response = self.llm.invoke(full_messages)
-        except Exception as e:
-            logger.error(
-                "ChatAgent LLM invoke failed",
-                extra={"session_id": session_id, "error": str(e)},
-            )
-            response = AIMessage(
-                content="I hit an error while generating a response. Please try again."
-            )
 
-        if not isinstance(response, AIMessage):
-            response = AIMessage(content=str(response))
+# -----------------------
+# State factory helpers
+# -----------------------
 
-        # 5) Append assistant response
-        messages.append(response)
+def create_initial_state(
+    *,
+    user_id: str,
+    session_id: str,
+    mode: Mode = "chat",
+    max_rag_iterations: int = 3,
+) -> GraphState:
+    """
+    Create a new initial GraphState with stable defaults.
+    Messages are initialized empty; agents will append LangChain BaseMessage objects.
+    """
+    return {
+        # Core
+        "user_id": user_id,
+        "session_id": session_id,
+        "mode": mode,
+        "ui_context": {
+            "selected_project_id": None,
+            "selected_model_id": None,
+            "selected_artifact_id": None,
+            "selected_experiment_id": None,
+        },
+        "messages": [],
 
-        # 6) Save draft for API gateway
-        state["llm_response_draft"] = response.content or ""
+        # Intent / task
+        "intent": None,
+        "sub_intent": None,
+        "active_task_type": None,
+        "active_task_id": None,
 
-        # 7) Store LangChain messages back into state (preferred format)
-        state["messages"] = messages
+        # Params
+        "convert_params": None,
+        "profile_params": None,
+        "patch_search_params": None,
+        "analysis_params": None,
 
-        # 8) Optionally request RAG (light heuristic). Safe to disable.
-        if self.enable_rag_autorequest:
-            self._maybe_request_rag(state)
+        # Runtime
+        "experiment_run_id": None,
+        "last_error": None,
+        "intermediate_results": [],
 
-        return state
+        # LLM
+        "llm_plan": None,
+        "llm_response_draft": None,
 
-    # -----------------------
-    # Internals
-    # -----------------------
+        # RAG
+        "rag_request": None,
+        "rag_result": None,
+        "rag_status": "idle",
+        "rag_observations": [],
+        "rag_iterations": 0,
+        "max_rag_iterations": max_rag_iterations,
+    }
 
-    def _load_system_prompt(self) -> str:
-        try:
-            return load_prompt("chat")
-        except FileNotFoundError:
-            logger.warning("Prompt 'chat' not found, using default system prompt")
-            return (
-                "You are the Agentic DL Workflow Suite assistant.\n"
-                "- You may call tools when needed (devices, runs, conversions, profiling).\n"
-                "- If you are unsure about tool flags, framework steps, or docs, request RAG.\n"
-                "- Be concise and action-oriented."
-            )
 
-    def _normalize_messages(self, raw: Sequence[Any]) -> List[BaseMessage]:
-        """
-        Convert mixed message formats into LangChain BaseMessage objects.
-        Supports legacy dict messages for smooth migration.
-        """
-        out: List[BaseMessage] = []
-        for m in raw:
-            if isinstance(m, BaseMessage):
-                out.append(m)
-                continue
+def reset_task_state(state: GraphState) -> GraphState:
+    """
+    Reset task-specific fields while preserving core session context + message history.
+    Useful when starting a new task within the same thread/session.
+    """
+    # Preserve core fields
+    preserved: GraphState = {
+        "user_id": state.get("user_id", ""),
+        "session_id": state.get("session_id", ""),
+        "mode": state.get("mode", "chat"),  # keep current mode
+        "ui_context": state.get("ui_context", {}),
+        "messages": state.get("messages", []),
+        "max_rag_iterations": state.get("max_rag_iterations", 3),
+    }
 
-            if isinstance(m, dict):
-                role = m.get("role")
-                content = m.get("content", "") or ""
+    # Reset task fields
+    preserved.update(
+        {
+            "intent": None,
+            "sub_intent": None,
+            "active_task_type": None,
+            "active_task_id": None,
 
-                if role == "system":
-                    out.append(SystemMessage(content=content))
-                elif role == "user":
-                    out.append(HumanMessage(content=content))
-                elif role == "assistant":
-                    tool_calls = m.get("tool_calls") or None
-                    if tool_calls:
-                        # Preserve tool_calls if your upstream stored them
-                        out.append(AIMessage(content=content, tool_calls=tool_calls))
-                    else:
-                        out.append(AIMessage(content=content))
-                elif role == "tool":
-                    # ToolMessage ideally includes tool_call_id; keep best-effort
-                    tool_call_id = m.get("tool_call_id") or "unknown"
-                    out.append(ToolMessage(content=content, tool_call_id=tool_call_id))
-                else:
-                    out.append(AIMessage(content=content))
-                continue
+            "convert_params": None,
+            "profile_params": None,
+            "patch_search_params": None,
+            "analysis_params": None,
 
-            # Unknown type -> stringify
-            out.append(AIMessage(content=str(m)))
+            "experiment_run_id": None,
+            "last_error": None,
+            "intermediate_results": [],
 
-        return out
+            "llm_plan": None,
+            "llm_response_draft": None,
 
-    def _build_rag_context(self, rag_result: Optional[Any]) -> str:
-        """
-        Accepts rag_result in dict or object form. Expected shapes:
-          - {"chunks": [{"text": "...", "source": "..."} , ...]}
-          - RagResult with .chunks where each chunk has .text/.source or dict-like
-        Returns a compact SystemMessage content string.
-        """
-        if rag_result is None:
-            return ""
-
-        chunks = None
-        if isinstance(rag_result, dict):
-            chunks = rag_result.get("chunks")
-        else:
-            chunks = getattr(rag_result, "chunks", None)
-
-        if not chunks:
-            return ""
-
-        lines: List[str] = ["Relevant context from local documentation:"]
-        for i, ch in enumerate(chunks[: self.rag_injection_max_chunks]):
-            text, source = "", ""
-
-            if isinstance(ch, dict):
-                text = (ch.get("text") or ch.get("chunk") or "")[: self.rag_injection_max_chars]
-                source = ch.get("source") or ch.get("doc_id") or ""
-            else:
-                text = (getattr(ch, "text", "") or "")[: self.rag_injection_max_chars]
-                source = getattr(ch, "source", "") or ""
-
-            if source:
-                lines.append(f"{i+1}. [{source}] {text}")
-            else:
-                lines.append(f"{i+1}. {text}")
-
-        return "\n".join(lines)
-
-    def _maybe_request_rag(self, state: GraphState) -> None:
-        """
-        Minimal heuristic:
-        - If the assistant expresses uncertainty, request RAG
-        - Uses last user message as query when possible
-        """
-        # Do not request if already requested/in progress
-        if state.get("rag_status") in ("requested", "running"):
-            return
-
-        rag_iterations = int(state.get("rag_iterations") or 0)
-        if rag_iterations >= self.max_rag_iterations:
-            return
-
-        messages: List[BaseMessage] = state.get("messages") or []
-        if not messages or not isinstance(messages[-1], AIMessage):
-            return
-
-        assistant_text = (messages[-1].content or "").lower()
-
-        triggers = (
-            "i'm not sure",
-            "not certain",
-            "need to check",
-            "depends on the version",
-            "refer to documentation",
-            "check the docs",
-            "i can't confirm",
-            "unknown flag",
-        )
-
-        if not any(t in assistant_text for t in triggers):
-            return
-
-        # Try to get the last user message as the retrieval query
-        last_user = None
-        for m in reversed(messages):
-            if isinstance(m, HumanMessage):
-                last_user = m.content
-                break
-
-        query = (last_user or "").strip()
-        if not query:
-            query = "Find relevant documentation for the current question."
-
-        state["rag_request"] = {
-            "query": query,
-            "max_chunks": 3,
-            "context_type": "general",
+            "rag_request": None,
+            "rag_result": None,
+            "rag_status": "idle",
+            "rag_observations": [],
+            "rag_iterations": 0,
         }
-        state["rag_status"] = "requested"
-        state["rag_iterations"] = rag_iterations + 1
-
-        logger.info(
-            "ChatAgent requested RAG",
-            extra={"session_id": state.get("session_id", "unknown"), "query": query},
-        )
+    )
+    return preserved

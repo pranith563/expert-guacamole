@@ -1,110 +1,181 @@
--- 001_create_modelhub.sql
--- Creates: database + schema + modelhub.models table for indexing ModelHub artifacts.
+import argparse
+import hashlib
+import os
+from pathlib import Path
+from typing import Optional, Tuple
 
-\set ON_ERROR_STOP on
+import psycopg
 
--- ============
--- Change these
--- ============
-\set DB_NAME 'agentic_suite'
-\set DB_OWNER 'postgres'
--- ============
+MODEL_EXTS = {
+    ".pb": ("pb", "tensorflow"),
+    ".pkl": ("pkl", "pytorch"),
+    ".pt": ("pt", "pytorch"),
+    ".pth": ("pth", "pytorch"),
+    ".onnx": ("onnx", "onnx"),
+    ".tflite": ("tflite", "tflite"),
+    ".dlc": ("dlc", "snpe"),
+}
 
--- Create DB (run while connected to postgres db)
-DO $$
-BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = :'DB_NAME') THEN
-    EXECUTE format('CREATE DATABASE %I OWNER %I', :'DB_NAME', :'DB_OWNER');
-  END IF;
-END $$;
+IGNORED_DIRS = {".git", "__pycache__", ".venv", "venv", ".mypy_cache", ".ruff_cache"}
 
-\connect :DB_NAME
 
--- UUID generator
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            b = f.read(chunk_size)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
 
-CREATE SCHEMA IF NOT EXISTS modelhub;
 
--- Main table: one row per artifact file (pb/onnx/pkl/etc.)
-CREATE TABLE IF NOT EXISTS modelhub.models (
-  model_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+def parse_identity(repo_root: Path, file_path: Path) -> Optional[Tuple[str, str, str, str, str]]:
+    """
+    Returns: (project, version, variant_path, artifact_name, artifact_stem)
+    repo_root/<project>/<version>/<variant_path...>/<artifact>
+    """
+    rel = file_path.relative_to(repo_root)
+    parts = rel.parts
+    if len(parts) < 3:
+        # Need at least project/version/file
+        return None
 
-  -- official = from local mirror; overlay = user workspace copy
-  source             TEXT NOT NULL CHECK (source IN ('official','overlay')),
+    project = parts[0]
+    version = parts[1]
+    artifact_name = parts[-1]
+    artifact_stem = Path(artifact_name).stem
+    variant_path = "/".join(parts[2:-1])  # may be ''
+    return project, version, variant_path, artifact_name, artifact_stem
 
-  -- Keep NOT NULL to support a clean UNIQUE constraint (official uses empty string)
-  owner_user_id      TEXT NOT NULL DEFAULT '',
 
-  project            TEXT NOT NULL,
-  version            TEXT NOT NULL,
+def should_skip_dir(dirpath: Path) -> bool:
+    return any(part in IGNORED_DIRS for part in dirpath.parts)
 
-  -- Derived from directory path under <project>/<version>/...
-  variant_path       TEXT NOT NULL DEFAULT '',
 
-  -- Filename info (supports v1p1.pb, v1p1a8w8.pb in same folder)
-  artifact_name      TEXT NOT NULL,
-  artifact_stem      TEXT NOT NULL,
+UPSERT_SQL = """
+INSERT INTO modelhub.models (
+  source, owner_user_id,
+  project, version,
+  variant_path, artifact_name, artifact_stem,
+  file_path, file_type, framework,
+  size_bytes, sha256,
+  meta
+)
+VALUES (
+  %(source)s, %(owner_user_id)s,
+  %(project)s, %(version)s,
+  %(variant_path)s, %(artifact_name)s, %(artifact_stem)s,
+  %(file_path)s, %(file_type)s, %(framework)s,
+  %(size_bytes)s, %(sha256)s,
+  %(meta)s::jsonb
+)
+ON CONFLICT ON CONSTRAINT uq_modelhub_models_identity
+DO UPDATE SET
+  file_path   = EXCLUDED.file_path,
+  file_type   = EXCLUDED.file_type,
+  framework   = EXCLUDED.framework,
+  size_bytes  = EXCLUDED.size_bytes,
+  sha256      = EXCLUDED.sha256,
+  meta        = EXCLUDED.meta,
+  updated_at  = now()
+RETURNING model_id;
+"""
 
-  -- Store path relative to official root (recommended) or absolute if you prefer
-  file_path          TEXT NOT NULL,
 
-  file_type          TEXT NOT NULL,   -- pb/pkl/onnx/tflite/dlc/...
-  framework          TEXT NULL,       -- tensorflow/pytorch/onnx/...
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--db",
+        default="postgresql://postgres:postgres@localhost:5432/agentic_suite",
+        help="Postgres connection string",
+    )
+    parser.add_argument(
+        "--root",
+        default="/data/modelhub/official/repo",
+        help="Official repo root on disk",
+    )
+    parser.add_argument(
+        "--source",
+        default="official",
+        choices=["official", "overlay"],
+        help="Index source (official or overlay)",
+    )
+    parser.add_argument(
+        "--owner",
+        default="",
+        help="owner_user_id (required for overlay; for official leave empty)",
+    )
+    parser.add_argument(
+        "--store-absolute-paths",
+        action="store_true",
+        help="Store absolute file_path in DB (default: store path relative to root)",
+    )
+    args = parser.parse_args()
 
-  size_bytes         BIGINT NOT NULL,
-  sha256             TEXT NOT NULL,
+    root = Path(args.root).resolve()
+    if not root.exists():
+        raise SystemExit(f"Root does not exist: {root}")
 
-  base_model_id      UUID NULL,       -- overlay clone provenance (optional)
-  meta               JSONB NOT NULL DEFAULT '{}'::jsonb,
+    if args.source == "overlay" and not args.owner:
+        raise SystemExit("For --source overlay, you must pass --owner <user_id>")
 
-  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+    indexed = 0
+    skipped = 0
 
--- Uniqueness: one artifact per (source, owner, project, version, variant_path, artifact_name)
-ALTER TABLE modelhub.models
-  DROP CONSTRAINT IF EXISTS uq_modelhub_models_identity;
+    with psycopg.connect(args.db) as conn:
+        with conn.cursor() as cur:
+            for dirpath, dirnames, filenames in os.walk(root):
+                dpath = Path(dirpath)
+                if should_skip_dir(dpath):
+                    dirnames[:] = []
+                    continue
 
-ALTER TABLE modelhub.models
-  ADD CONSTRAINT uq_modelhub_models_identity
-  UNIQUE (source, owner_user_id, project, version, variant_path, artifact_name);
+                for fn in filenames:
+                    p = dpath / fn
+                    ext = p.suffix.lower()
+                    if ext not in MODEL_EXTS:
+                        continue
 
--- Useful indexes for browsing/filtering
-CREATE INDEX IF NOT EXISTS ix_modelhub_models_project_version
-ON modelhub.models (project, version);
+                    ident = parse_identity(root, p)
+                    if ident is None:
+                        skipped += 1
+                        continue
 
-CREATE INDEX IF NOT EXISTS ix_modelhub_models_source_owner
-ON modelhub.models (source, owner_user_id);
+                    project, version, variant_path, artifact_name, artifact_stem = ident
+                    file_type, framework = MODEL_EXTS[ext]
+                    size_bytes = p.stat().st_size
+                    sha = sha256_file(p)
 
-CREATE INDEX IF NOT EXISTS ix_modelhub_models_sha
-ON modelhub.models (sha256);
+                    file_path_db = str(p if args.store_absolute_paths else p.relative_to(root))
 
--- Auto-update updated_at
-CREATE OR REPLACE FUNCTION modelhub.set_updated_at()
-RETURNS TRIGGER AS $$
-BEGIN
-  NEW.updated_at = now();
-  RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
+                    meta = "{}"  # keep as JSON string; add tags later if you want
 
-DROP TRIGGER IF EXISTS trg_modelhub_models_updated_at ON modelhub.models;
+                    cur.execute(
+                        UPSERT_SQL,
+                        {
+                            "source": args.source,
+                            "owner_user_id": args.owner or "",
+                            "project": project,
+                            "version": version,
+                            "variant_path": variant_path,
+                            "artifact_name": artifact_name,
+                            "artifact_stem": artifact_stem,
+                            "file_path": file_path_db,
+                            "file_type": file_type,
+                            "framework": framework,
+                            "size_bytes": size_bytes,
+                            "sha256": sha,
+                            "meta": meta,
+                        },
+                    )
+                    _model_id = cur.fetchone()[0]
+                    indexed += 1
 
-CREATE TRIGGER trg_modelhub_models_updated_at
-BEFORE UPDATE ON modelhub.models
-FOR EACH ROW EXECUTE FUNCTION modelhub.set_updated_at();
+            conn.commit()
 
-SELECT source, count(*) FROM modelhub.models GROUP BY source;
+    print(f"Done. Indexed={indexed}, skipped_invalid_paths={skipped}")
 
-SELECT project, count(*) 
-FROM modelhub.models
-WHERE source='official'
-GROUP BY project
-ORDER BY count(*) DESC
-LIMIT 20;
 
-SELECT *
-FROM modelhub.models
-WHERE project='<some_project>' AND version='<some_version>'
-ORDER BY variant_path, artifact_name
-LIMIT 50;
+if __name__ == "__main__":
+    main()

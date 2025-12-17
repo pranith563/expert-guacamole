@@ -1,176 +1,129 @@
 """
-Experiments API routes (minimal functional v0).
-
-Auto-creates schema/table:
-- experiments.runs
-
-You can replace this later with your full experiments design.
+Chat API routes - interface to orchestrator (HTTP proxy).
 """
 
 from __future__ import annotations
 
-import json
+import time
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import httpx
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncConnection
 
-from api_gateway.deps import get_conn
+from api_gateway.deps import get_orchestrator_client
 
 router = APIRouter()
 
-
-async def _ensure_experiments_schema(conn: AsyncConnection) -> None:
-    # Safe to call repeatedly.
-    await conn.execute(text("CREATE SCHEMA IF NOT EXISTS experiments;"))
-    await conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS experiments.runs (
-          run_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-          user_id      TEXT NOT NULL DEFAULT '',
-          session_id   TEXT NOT NULL DEFAULT '',
-          mode         TEXT NOT NULL DEFAULT 'chat',
-          model_id     UUID NULL,
-          status       TEXT NOT NULL DEFAULT 'created',
-          params       JSONB NOT NULL DEFAULT '{}'::jsonb,
-          summary      JSONB NOT NULL DEFAULT '{}'::jsonb,
-          created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-          updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-    """))
-    await conn.execute(text("""
-        CREATE INDEX IF NOT EXISTS ix_experiments_runs_created_at
-        ON experiments.runs (created_at DESC);
-    """))
+Mode = Literal["chat", "convert", "profile", "patch_search"]
 
 
-class ExperimentRun(BaseModel):
-    run_id: str
-    user_id: str = ""
-    session_id: str = ""
-    mode: str = "chat"
-    model_id: Optional[str] = None
-    status: str = "created"
-    params: dict[str, Any] = Field(default_factory=dict)
-    summary: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime
-    updated_at: datetime
+class UIContext(BaseModel):
+    selected_project_id: Optional[str] = None
+    selected_model_id: Optional[str] = None
+    selected_artifact_id: Optional[str] = None
 
 
-class CreateRunRequest(BaseModel):
-    user_id: str = ""
-    session_id: str = ""
-    mode: str = "chat"
-    model_id: Optional[str] = None
-    params: dict[str, Any] = Field(default_factory=dict)
+class ChatMessage(BaseModel):
+    """Chat message (UI-facing)."""
+    role: Literal["user", "assistant", "system"] = "assistant"
+    content: str
+    timestamp: Optional[datetime] = None
 
 
-@router.get("/")
-async def list_runs(
-    limit: int = Query(50, ge=1, le=500),
-    conn: AsyncConnection = Depends(get_conn),
-) -> list[ExperimentRun]:
-    await _ensure_experiments_schema(conn)
+class ChatRequest(BaseModel):
+    """
+    Chat request from UI.
+    """
+    user_id: str = "ui_user"
+    session_id: str = Field(default_factory=lambda: f"sess_{int(time.time() * 1000)}")
 
-    rows = (await conn.execute(
-        text("""
-            SELECT run_id, user_id, session_id, mode, model_id, status, params, summary, created_at, updated_at
-            FROM experiments.runs
-            ORDER BY created_at DESC
-            LIMIT :limit
-        """),
-        {"limit": limit},
-    )).mappings().all()
+    message: str
+    mode: Mode = "chat"
+    ui_context: UIContext = Field(default_factory=UIContext)
 
-    return [
-        ExperimentRun(
-            run_id=str(r["run_id"]),
-            user_id=r["user_id"] or "",
-            session_id=r["session_id"] or "",
-            mode=r["mode"],
-            model_id=str(r["model_id"]) if r["model_id"] else None,
-            status=r["status"],
-            params=dict(r["params"] or {}),
-            summary=dict(r["summary"] or {}),
-            created_at=r["created_at"],
-            updated_at=r["updated_at"],
-        )
-        for r in rows
-    ]
+    # extra knobs per mode (convert/profile/patch_search)
+    mode_params: dict[str, Any] = Field(default_factory=dict)
 
 
-@router.post("/")
-async def create_run(
-    req: CreateRunRequest,
-    conn: AsyncConnection = Depends(get_conn),
-) -> ExperimentRun:
-    await _ensure_experiments_schema(conn)
+class ChatResponse(BaseModel):
+    """
+    Chat response to UI.
+    """
+    session_id: str
+    mode: Mode
+    messages: list[ChatMessage]
+    status: Literal["completed", "failed"]
 
-    row = (await conn.execute(
-        text("""
-            INSERT INTO experiments.runs (user_id, session_id, mode, model_id, status, params)
-            VALUES (:user_id, :session_id, :mode, :model_id, 'created', :params::jsonb)
-            RETURNING run_id, user_id, session_id, mode, model_id, status, params, summary, created_at, updated_at
-        """),
-        {
-            "user_id": req.user_id,
-            "session_id": req.session_id,
-            "mode": req.mode,
-            "model_id": req.model_id,
-            "params": json.dumps(req.params),
+
+@router.post("/", response_model=ChatResponse)
+async def chat(
+    request: ChatRequest,
+    orchestrator: httpx.AsyncClient = Depends(get_orchestrator_client),
+) -> ChatResponse:
+    """
+    Proxies a chat request to the orchestrator service (/api/agent/interact).
+    """
+    payload = {
+        "user_id": request.user_id,
+        "session_id": request.session_id,
+        "mode": request.mode,
+        "ui_context": request.ui_context.model_dump(),
+        "message": {
+            "role": "user",
+            "content": request.message,
+            "timestamp": datetime.utcnow().isoformat(),
         },
-    )).mappings().first()
+        "mode_params": request.mode_params,
+        # history intentionally omitted (you disabled in frontend; orchestrator uses thread_id)
+    }
 
-    if not row:
-        raise HTTPException(status_code=500, detail="Failed to create run")
+    try:
+        resp = await orchestrator.post("/api/agent/interact", json=payload)
+    except httpx.RequestError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to reach orchestrator service: {e}",
+        )
 
-    await conn.commit()
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"Orchestrator error: {resp.text}",
+        )
 
-    return ExperimentRun(
-        run_id=str(row["run_id"]),
-        user_id=row["user_id"] or "",
-        session_id=row["session_id"] or "",
-        mode=row["mode"],
-        model_id=str(row["model_id"]) if row["model_id"] else None,
-        status=row["status"],
-        params=dict(row["params"] or {}),
-        summary=dict(row["summary"] or {}),
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
+    data = resp.json()
+
+    # Orchestrator response expected:
+    # { session_id, mode, ui_context, messages: [...], agent_state, mode_params, ... }
+    messages_out: list[ChatMessage] = []
+    for m in data.get("messages", []):
+        role = m.get("role", "assistant")
+        if role not in ("user", "assistant", "system"):
+            role = "assistant"
+        messages_out.append(
+            ChatMessage(
+                role=role,  # type: ignore
+                content=m.get("content", ""),
+                timestamp=None,
+            )
+        )
+
+    return ChatResponse(
+        session_id=data.get("session_id", request.session_id),
+        mode=data.get("mode", request.mode),
+        messages=messages_out,
+        status="completed",
     )
 
 
-@router.get("/{run_id}")
-async def get_run(
-    run_id: str,
-    conn: AsyncConnection = Depends(get_conn),
-) -> ExperimentRun:
-    await _ensure_experiments_schema(conn)
-
-    row = (await conn.execute(
-        text("""
-            SELECT run_id, user_id, session_id, mode, model_id, status, params, summary, created_at, updated_at
-            FROM experiments.runs
-            WHERE run_id = :run_id
-            LIMIT 1
-        """),
-        {"run_id": run_id},
-    )).mappings().first()
-
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
-
-    return ExperimentRun(
-        run_id=str(row["run_id"]),
-        user_id=row["user_id"] or "",
-        session_id=row["session_id"] or "",
-        mode=row["mode"],
-        model_id=str(row["model_id"]) if row["model_id"] else None,
-        status=row["status"],
-        params=dict(row["params"] or {}),
-        summary=dict(row["summary"] or {}),
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-    )
+@router.get("/modes")
+async def list_modes() -> list[dict[str, str]]:
+    """List available chat modes."""
+    return [
+        {"id": "chat", "name": "Chat", "description": "General conversation"},
+        {"id": "convert", "name": "Convert", "description": "Model conversion"},
+        {"id": "profile", "name": "Profile", "description": "Model profiling"},
+        {"id": "patch_search", "name": "Patch Search", "description": "Search for solutions"},
+    ]

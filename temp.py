@@ -1,15 +1,20 @@
 """
-Models API routes (ModelHub artifacts).
+Experiments API routes (minimal functional v0).
 
-Backed by modelhub.models in Postgres.
+Auto-creates schema/table:
+- experiments.runs
+
+You can replace this later with your full experiments design.
 """
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+import json
+from datetime import datetime
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -17,211 +22,155 @@ from api_gateway.deps import get_conn
 
 router = APIRouter()
 
-Source = Literal["official", "overlay"]
+
+async def _ensure_experiments_schema(conn: AsyncConnection) -> None:
+    # Safe to call repeatedly.
+    await conn.execute(text("CREATE SCHEMA IF NOT EXISTS experiments;"))
+    await conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS experiments.runs (
+          run_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id      TEXT NOT NULL DEFAULT '',
+          session_id   TEXT NOT NULL DEFAULT '',
+          mode         TEXT NOT NULL DEFAULT 'chat',
+          model_id     UUID NULL,
+          status       TEXT NOT NULL DEFAULT 'created',
+          params       JSONB NOT NULL DEFAULT '{}'::jsonb,
+          summary      JSONB NOT NULL DEFAULT '{}'::jsonb,
+          created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+          updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+    """))
+    await conn.execute(text("""
+        CREATE INDEX IF NOT EXISTS ix_experiments_runs_created_at
+        ON experiments.runs (created_at DESC);
+    """))
 
 
-class Model(BaseModel):
-    """Model metadata (one artifact row)."""
-    id: str
-    name: str
-    framework: str
-    path: str
+class ExperimentRun(BaseModel):
+    run_id: str
+    user_id: str = ""
+    session_id: str = ""
+    mode: str = "chat"
+    model_id: Optional[str] = None
+    status: str = "created"
+    params: dict[str, Any] = Field(default_factory=dict)
+    summary: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    updated_at: datetime
 
 
-class FileItem(BaseModel):
-    model_id: str
-    name: str
-    file_path: str
-    file_type: str
-    framework: Optional[str] = None
-    size_bytes: int
-    sha256: str
-
-
-class BrowseResponse(BaseModel):
-    prefix: str
-    folders: list[str]
-    files: list[FileItem]
+class CreateRunRequest(BaseModel):
+    user_id: str = ""
+    session_id: str = ""
+    mode: str = "chat"
+    model_id: Optional[str] = None
+    params: dict[str, Any] = Field(default_factory=dict)
 
 
 @router.get("/")
-async def list_models(
-    # Common filters
-    source: Source = Query("official"),
-    owner_user_id: str = Query("", description="official uses empty string; overlay uses a user_id"),
-    project: Optional[str] = Query(None),
-    version: Optional[str] = Query(None),
-    prefix: Optional[str] = Query(None, description="Path prefix like 'HC/P2Q_HC'"),
-    limit: int = Query(200, ge=1, le=2000),
-    offset: int = Query(0, ge=0),
+async def list_runs(
+    limit: int = Query(50, ge=1, le=500),
     conn: AsyncConnection = Depends(get_conn),
-) -> list[Model]:
-    """
-    Returns artifact rows as a flat list. UI can use /browse for tree navigation.
-    """
-    where = ["source = :source", "owner_user_id = :owner_user_id"]
-    params: dict[str, Any] = {
-        "source": source,
-        "owner_user_id": owner_user_id,
-        "limit": limit,
-        "offset": offset,
-    }
+) -> list[ExperimentRun]:
+    await _ensure_experiments_schema(conn)
 
-    if project:
-        where.append("split_part(file_path, '/', 1) = :project")
-        params["project"] = project
-    if version:
-        where.append("split_part(file_path, '/', 2) = :version")
-        params["version"] = version
-    if prefix:
-        p = prefix.strip().strip("/")
-        where.append("file_path LIKE :prefix_like")
-        params["prefix_like"] = f"{p}/%"
+    rows = (await conn.execute(
+        text("""
+            SELECT run_id, user_id, session_id, mode, model_id, status, params, summary, created_at, updated_at
+            FROM experiments.runs
+            ORDER BY created_at DESC
+            LIMIT :limit
+        """),
+        {"limit": limit},
+    )).mappings().all()
 
-    sql = text(f"""
-        SELECT model_id, artifact_name, framework, file_path
-        FROM modelhub.models
-        WHERE {' AND '.join(where)}
-        ORDER BY file_path
-        LIMIT :limit OFFSET :offset
-    """)
-
-    rows = (await conn.execute(sql, params)).all()
     return [
-        Model(
-            id=str(r.model_id),
-            name=r.artifact_name,
-            framework=r.framework or "",
-            path=r.file_path,
+        ExperimentRun(
+            run_id=str(r["run_id"]),
+            user_id=r["user_id"] or "",
+            session_id=r["session_id"] or "",
+            mode=r["mode"],
+            model_id=str(r["model_id"]) if r["model_id"] else None,
+            status=r["status"],
+            params=dict(r["params"] or {}),
+            summary=dict(r["summary"] or {}),
+            created_at=r["created_at"],
+            updated_at=r["updated_at"],
         )
         for r in rows
     ]
 
 
-@router.get("/browse", response_model=BrowseResponse)
-async def browse_prefix(
-    prefix: str = Query(..., description="Directory-like prefix e.g. 'HC/P2Q_HC'"),
-    source: Source = Query("official"),
-    owner_user_id: str = Query(""),
+@router.post("/")
+async def create_run(
+    req: CreateRunRequest,
     conn: AsyncConnection = Depends(get_conn),
-) -> BrowseResponse:
-    """
-    Returns immediate child folders + files under the given prefix.
-    Mirrors filesystem structure via modelhub.models.file_path.
-    """
-    prefix_norm = prefix.strip().strip("/")
-    like_prefix = f"{prefix_norm}/%"
+) -> ExperimentRun:
+    await _ensure_experiments_schema(conn)
 
-    sql = text("""
-        WITH base AS (
-          SELECT
-            model_id,
-            file_path,
-            file_type,
-            framework,
-            size_bytes,
-            sha256,
-            substring(file_path from length(:prefix) + 2) AS rest
-          FROM modelhub.models
-          WHERE source = :source
-            AND owner_user_id = :owner_user_id
-            AND file_path LIKE :like_prefix
-        ),
-        folders AS (
-          SELECT DISTINCT split_part(rest, '/', 1) AS name
-          FROM base
-          WHERE rest LIKE '%/%'
-        ),
-        files AS (
-          SELECT
-            model_id,
-            rest AS name,
-            file_path,
-            file_type,
-            framework,
-            size_bytes,
-            sha256
-          FROM base
-          WHERE rest NOT LIKE '%/%'
-        )
-        SELECT 'folder' AS kind,
-               name,
-               NULL::uuid AS model_id,
-               NULL::text AS file_path,
-               NULL::text AS file_type,
-               NULL::text AS framework,
-               NULL::bigint AS size_bytes,
-               NULL::text AS sha256
-        FROM folders
-        UNION ALL
-        SELECT 'file' AS kind,
-               name,
-               model_id,
-               file_path,
-               file_type,
-               framework,
-               size_bytes,
-               sha256
-        FROM files
-        ORDER BY kind, name
-    """)
+    row = (await conn.execute(
+        text("""
+            INSERT INTO experiments.runs (user_id, session_id, mode, model_id, status, params)
+            VALUES (:user_id, :session_id, :mode, :model_id, 'created', :params::jsonb)
+            RETURNING run_id, user_id, session_id, mode, model_id, status, params, summary, created_at, updated_at
+        """),
+        {
+            "user_id": req.user_id,
+            "session_id": req.session_id,
+            "mode": req.mode,
+            "model_id": req.model_id,
+            "params": json.dumps(req.params),
+        },
+    )).mappings().first()
 
-    rows = (await conn.execute(sql, {
-        "source": source,
-        "owner_user_id": owner_user_id,
-        "prefix": prefix_norm,
-        "like_prefix": like_prefix,
-    })).mappings().all()
+    if not row:
+        raise HTTPException(status_code=500, detail="Failed to create run")
 
-    folders: list[str] = []
-    files: list[FileItem] = []
+    await conn.commit()
 
-    for r in rows:
-        if r["kind"] == "folder":
-            folders.append(r["name"])
-        else:
-            files.append(FileItem(
-                model_id=str(r["model_id"]),
-                name=r["name"],
-                file_path=r["file_path"],
-                file_type=r["file_type"],
-                framework=r["framework"],
-                size_bytes=int(r["size_bytes"]),
-                sha256=r["sha256"],
-            ))
-
-    return BrowseResponse(prefix=prefix_norm, folders=folders, files=files)
-
-
-@router.post("/upload")
-async def upload_model() -> Model:
-    """
-    Upload will be implemented with overlays (multipart upload -> /data/modelhub/tmp -> atomic move into overlays).
-    """
-    raise HTTPException(
-        status_code=501,
-        detail="upload_model is not implemented yet. Use overlay workflow later.",
+    return ExperimentRun(
+        run_id=str(row["run_id"]),
+        user_id=row["user_id"] or "",
+        session_id=row["session_id"] or "",
+        mode=row["mode"],
+        model_id=str(row["model_id"]) if row["model_id"] else None,
+        status=row["status"],
+        params=dict(row["params"] or {}),
+        summary=dict(row["summary"] or {}),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 
-@router.get("/{model_id}")
-async def get_model(
-    model_id: str,
+@router.get("/{run_id}")
+async def get_run(
+    run_id: str,
     conn: AsyncConnection = Depends(get_conn),
-) -> Model:
-    sql = text("""
-        SELECT model_id, artifact_name, framework, file_path
-        FROM modelhub.models
-        WHERE model_id = :model_id
-        LIMIT 1
-    """)
-    row = (await conn.execute(sql, {"model_id": model_id})).first()
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+) -> ExperimentRun:
+    await _ensure_experiments_schema(conn)
 
-    return Model(
-        id=str(row.model_id),
-        name=row.artifact_name,
-        framework=row.framework or "",
-        path=row.file_path,
+    row = (await conn.execute(
+        text("""
+            SELECT run_id, user_id, session_id, mode, model_id, status, params, summary, created_at, updated_at
+            FROM experiments.runs
+            WHERE run_id = :run_id
+            LIMIT 1
+        """),
+        {"run_id": run_id},
+    )).mappings().first()
+
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+
+    return ExperimentRun(
+        run_id=str(row["run_id"]),
+        user_id=row["user_id"] or "",
+        session_id=row["session_id"] or "",
+        mode=row["mode"],
+        model_id=str(row["model_id"]) if row["model_id"] else None,
+        status=row["status"],
+        params=dict(row["params"] or {}),
+        summary=dict(row["summary"] or {}),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )

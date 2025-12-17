@@ -1,28 +1,27 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
+from typing import Any, Optional
+
+import asyncpg
 
 
-@dataclass(frozen=True)
-class Settings:
-    # DB: asyncpg URL
-    database_url: str = os.getenv(
-        "MODELHUB_DB_URL",
-        "postgresql://postgres:postgres@localhost:5432/agentic_suite",
-    )
+@dataclass
+class DB:
+    pool: asyncpg.Pool
 
-    # DB table (schema-qualified)
-    table_fqdn: str = os.getenv("MODELHUB_TABLE", "modelhub.models")
+    @classmethod
+    async def connect(cls, database_url: str) -> "DB":
+        pool = await asyncpg.create_pool(dsn=database_url, min_size=1, max_size=10)
+        return cls(pool=pool)
 
-    # Filesystem roots (used only when resolving absolute path for tools)
-    official_root: str = os.getenv("MODELHUB_OFFICIAL_ROOT", "/data/modelhub/official/repo")
-    overlay_root: str = os.getenv("MODELHUB_OVERLAY_ROOT", "/data/modelhub/overlays")
+    async def close(self) -> None:
+        await self.pool.close()
 
-    # Server bind
-    host: str = os.getenv("MODELHUB_MCP_HOST", "0.0.0.0")
-    port: int = int(os.getenv("MODELHUB_MCP_PORT", "5310"))
+    async def fetch(self, sql: str, *args: Any) -> list[asyncpg.Record]:
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(sql, *args)
 
-
-def load_settings() -> Settings:
-    return Settings()
+    async def fetchrow(self, sql: str, *args: Any) -> Optional[asyncpg.Record]:
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(sql, *args)

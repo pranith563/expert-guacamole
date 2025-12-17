@@ -1,16 +1,12 @@
 """
-Projects API routes.
+Models API routes (ModelHub artifacts).
 
-Backed by modelhub.models in Postgres:
-- Projects = split_part(file_path, '/', 1)
-- Versions = split_part(file_path, '/', 2) per project
-
-This is read-only for now (create/update not implemented).
+Backed by modelhub.models in Postgres.
 """
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -24,92 +20,208 @@ router = APIRouter()
 Source = Literal["official", "overlay"]
 
 
-class Project(BaseModel):
-    """Project model."""
+class Model(BaseModel):
+    """Model metadata (one artifact row)."""
     id: str
     name: str
-    description: str = ""
+    framework: str
+    path: str
 
 
-class CreateProjectRequest(BaseModel):
-    """Request to create a project."""
+class FileItem(BaseModel):
+    model_id: str
     name: str
-    description: str = ""
+    file_path: str
+    file_type: str
+    framework: Optional[str] = None
+    size_bytes: int
+    sha256: str
 
 
-class VersionsResponse(BaseModel):
-    project: str
-    source: Source
-    owner_user_id: str
-    versions: list[str]
+class BrowseResponse(BaseModel):
+    prefix: str
+    folders: list[str]
+    files: list[FileItem]
 
 
 @router.get("/")
-async def list_projects(
+async def list_models(
+    # Common filters
     source: Source = Query("official"),
     owner_user_id: str = Query("", description="official uses empty string; overlay uses a user_id"),
+    project: Optional[str] = Query(None),
+    version: Optional[str] = Query(None),
+    prefix: Optional[str] = Query(None, description="Path prefix like 'HC/P2Q_HC'"),
+    limit: int = Query(200, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
     conn: AsyncConnection = Depends(get_conn),
-) -> list[Project]:
-    sql = text("""
-        SELECT DISTINCT split_part(file_path, '/', 1) AS project
-        FROM modelhub.models
-        WHERE source = :source AND owner_user_id = :owner_user_id
-        ORDER BY project
-    """)
-    rows = (await conn.execute(sql, {"source": source, "owner_user_id": owner_user_id})).all()
-    return [Project(id=r.project, name=r.project, description="") for r in rows]
-
-
-@router.post("/")
-async def create_project(request: CreateProjectRequest) -> Project:
+) -> list[Model]:
     """
-    Creating projects in ModelHub implies creating directories + git/overlay workflow.
-    We'll add this once overlay workflow is implemented.
+    Returns artifact rows as a flat list. UI can use /browse for tree navigation.
+    """
+    where = ["source = :source", "owner_user_id = :owner_user_id"]
+    params: dict[str, Any] = {
+        "source": source,
+        "owner_user_id": owner_user_id,
+        "limit": limit,
+        "offset": offset,
+    }
+
+    if project:
+        where.append("split_part(file_path, '/', 1) = :project")
+        params["project"] = project
+    if version:
+        where.append("split_part(file_path, '/', 2) = :version")
+        params["version"] = version
+    if prefix:
+        p = prefix.strip().strip("/")
+        where.append("file_path LIKE :prefix_like")
+        params["prefix_like"] = f"{p}/%"
+
+    sql = text(f"""
+        SELECT model_id, artifact_name, framework, file_path
+        FROM modelhub.models
+        WHERE {' AND '.join(where)}
+        ORDER BY file_path
+        LIMIT :limit OFFSET :offset
+    """)
+
+    rows = (await conn.execute(sql, params)).all()
+    return [
+        Model(
+            id=str(r.model_id),
+            name=r.artifact_name,
+            framework=r.framework or "",
+            path=r.file_path,
+        )
+        for r in rows
+    ]
+
+
+@router.get("/browse", response_model=BrowseResponse)
+async def browse_prefix(
+    prefix: str = Query(..., description="Directory-like prefix e.g. 'HC/P2Q_HC'"),
+    source: Source = Query("official"),
+    owner_user_id: str = Query(""),
+    conn: AsyncConnection = Depends(get_conn),
+) -> BrowseResponse:
+    """
+    Returns immediate child folders + files under the given prefix.
+    Mirrors filesystem structure via modelhub.models.file_path.
+    """
+    prefix_norm = prefix.strip().strip("/")
+    like_prefix = f"{prefix_norm}/%"
+
+    sql = text("""
+        WITH base AS (
+          SELECT
+            model_id,
+            file_path,
+            file_type,
+            framework,
+            size_bytes,
+            sha256,
+            substring(file_path from length(:prefix) + 2) AS rest
+          FROM modelhub.models
+          WHERE source = :source
+            AND owner_user_id = :owner_user_id
+            AND file_path LIKE :like_prefix
+        ),
+        folders AS (
+          SELECT DISTINCT split_part(rest, '/', 1) AS name
+          FROM base
+          WHERE rest LIKE '%/%'
+        ),
+        files AS (
+          SELECT
+            model_id,
+            rest AS name,
+            file_path,
+            file_type,
+            framework,
+            size_bytes,
+            sha256
+          FROM base
+          WHERE rest NOT LIKE '%/%'
+        )
+        SELECT 'folder' AS kind,
+               name,
+               NULL::uuid AS model_id,
+               NULL::text AS file_path,
+               NULL::text AS file_type,
+               NULL::text AS framework,
+               NULL::bigint AS size_bytes,
+               NULL::text AS sha256
+        FROM folders
+        UNION ALL
+        SELECT 'file' AS kind,
+               name,
+               model_id,
+               file_path,
+               file_type,
+               framework,
+               size_bytes,
+               sha256
+        FROM files
+        ORDER BY kind, name
+    """)
+
+    rows = (await conn.execute(sql, {
+        "source": source,
+        "owner_user_id": owner_user_id,
+        "prefix": prefix_norm,
+        "like_prefix": like_prefix,
+    })).mappings().all()
+
+    folders: list[str] = []
+    files: list[FileItem] = []
+
+    for r in rows:
+        if r["kind"] == "folder":
+            folders.append(r["name"])
+        else:
+            files.append(FileItem(
+                model_id=str(r["model_id"]),
+                name=r["name"],
+                file_path=r["file_path"],
+                file_type=r["file_type"],
+                framework=r["framework"],
+                size_bytes=int(r["size_bytes"]),
+                sha256=r["sha256"],
+            ))
+
+    return BrowseResponse(prefix=prefix_norm, folders=folders, files=files)
+
+
+@router.post("/upload")
+async def upload_model() -> Model:
+    """
+    Upload will be implemented with overlays (multipart upload -> /data/modelhub/tmp -> atomic move into overlays).
     """
     raise HTTPException(
         status_code=501,
-        detail="create_project is not implemented. Use overlay workflow / GitOps later.",
+        detail="upload_model is not implemented yet. Use overlay workflow later.",
     )
 
 
-@router.get("/{project_id}")
-async def get_project(
-    project_id: str,
-    source: Source = Query("official"),
-    owner_user_id: str = Query(""),
+@router.get("/{model_id}")
+async def get_model(
+    model_id: str,
     conn: AsyncConnection = Depends(get_conn),
-) -> Project:
+) -> Model:
     sql = text("""
-        SELECT 1
+        SELECT model_id, artifact_name, framework, file_path
         FROM modelhub.models
-        WHERE source = :source AND owner_user_id = :owner_user_id
-          AND split_part(file_path, '/', 1) = :project
+        WHERE model_id = :model_id
         LIMIT 1
     """)
-    row = (await conn.execute(sql, {"source": source, "owner_user_id": owner_user_id, "project": project_id})).first()
+    row = (await conn.execute(sql, {"model_id": model_id})).first()
     if not row:
-        raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
-    return Project(id=project_id, name=project_id, description="")
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
 
-
-@router.get("/{project_id}/versions", response_model=VersionsResponse)
-async def list_versions(
-    project_id: str,
-    source: Source = Query("official"),
-    owner_user_id: str = Query(""),
-    conn: AsyncConnection = Depends(get_conn),
-) -> VersionsResponse:
-    sql = text("""
-        SELECT DISTINCT split_part(file_path, '/', 2) AS version
-        FROM modelhub.models
-        WHERE source = :source AND owner_user_id = :owner_user_id
-          AND split_part(file_path, '/', 1) = :project
-        ORDER BY version
-    """)
-    rows = (await conn.execute(sql, {"source": source, "owner_user_id": owner_user_id, "project": project_id})).all()
-    return VersionsResponse(
-        project=project_id,
-        source=source,
-        owner_user_id=owner_user_id,
-        versions=[r.version for r in rows if r.version],
+    return Model(
+        id=str(row.model_id),
+        name=row.artifact_name,
+        framework=row.framework or "",
+        path=row.file_path,
     )

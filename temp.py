@@ -1,624 +1,323 @@
-from .schemas import ConversionContext, ConversionPlanIR, CompiledPlan
-from .planner import ConverterPlanner
-from .compiler import PlanCompiler
-from .executor import PlanExecutor
+from .config import ConverterConfig, ConverterToolNames
+from .graph import build_converter_subgraph
+
+agentic_suite/agents/converter/config.py
 
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Dict, Any, Optional
+from typing import Optional
 
 
 @dataclass(frozen=True)
 class ConverterToolNames:
-    # ModelHub (read-only)
-    modelhub_get_model: str
-    modelhub_get_by_path: str
+    # ModelHub tools (namespaced keys in tool catalog)
+    modelhub_get_model: str = "modelhub:modelhub_get_model"
+    modelhub_get_by_path: str = "modelhub:modelhub_get_by_path"
 
-    # SNPE/QNN reflective registry
-    list_tools: str
-    get_tool_spec: str
-    run_tool: str
+    # Experiments tools
+    experiments_create_run: str = "experiments:experiments_create_run"
+    experiments_update_run_status: str = "experiments:experiments_update_run_status"
+    experiments_attach_artifacts: str = "experiments:experiments_attach_artifacts"
 
-
-@dataclass(frozen=True)
-class ConverterPaths:
-    experiments_root: str = "/data/experiments"
-
-
-@dataclass(frozen=True)
-class ConverterPolicyConfig:
-    """
-    Minimal policy buckets. Expand over time.
-    The compiler only applies args that are present in tool specs.
-    """
-    policy_version: str = "2026-01-06"
-    buckets: Dict[str, Dict[str, Dict[str, Any]]] = None  # runtime -> op -> bucket -> optional_args
-
-    def __post_init__(self):
-        if self.buckets is None:
-            object.__setattr__(self, "buckets", {
-                "snpe": {
-                    "convert_model": {
-                        "safe": {"precision": "fp16"},
-                        "balanced": {"precision": "fp16"},
-                        "fast": {"precision": "fp16"},
-                        "max_perf": {"precision": "fp16"},
-                    },
-                    "cache_model": {
-                        "safe": {},
-                        "balanced": {"accelerator": "dsp"},
-                        "fast": {"accelerator": "htp"},
-                        "max_perf": {"accelerator": "htp"},
-                    },
-                    "validate_model": {
-                        "safe": {},
-                        "balanced": {},
-                        "fast": {},
-                        "max_perf": {},
-                    },
-                },
-                "qnn": {
-                    "convert_model": {
-                        "safe": {"precision": "fp16"},
-                        "balanced": {"precision": "fp16"},
-                        "fast": {"precision": "fp16"},
-                        "max_perf": {"precision": "fp16"},
-                    },
-                    "cache_model": {
-                        "safe": {},
-                        "balanced": {},
-                        "fast": {},
-                        "max_perf": {},
-                    },
-                    "validate_model": {
-                        "safe": {},
-                        "balanced": {},
-                        "fast": {},
-                        "max_perf": {},
-                    },
-                },
-            })
+    # QAIRT reflective registry + executor
+    qairt_list_tools: str = "qairt:qairt_list_tools"
+    qairt_get_tool_spec: str = "qairt:qairt_get_tool_spec"
+    qairt_run: str = "qairt:qairt_run"
 
 
 @dataclass(frozen=True)
 class ConverterConfig:
-    tool_names: ConverterToolNames
-    paths: ConverterPaths = ConverterPaths()
-    policy: ConverterPolicyConfig = ConverterPolicyConfig()
+    tools: ConverterToolNames = ConverterToolNames()
 
-    # Safety / planner loop limits
-    planner_max_iters: int = 8
-    max_tools_in_catalog: int = 2000
+    experiments_root: str = "/data/experiments"
 
+    # Planner loop behavior
+    planner_max_tool_iters: int = 8
 
---------////
+    # Replan loop behavior (compiler/executor -> planner)
+    max_replans: int = 2
+
+    # Tool binding mode from tool_policy.yaml (you use "convert")
+    tool_mode: str = "convert"
+
+    # Optional: prompt override path (if you want to load md at runtime)
+    planner_prompt_path: Optional[str] = None
+
+agentic_suite/agents/converter/state.py
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Literal
+from typing import Any, Dict, List, Literal, Optional, TypedDict
+
+
+class ConversionRequest(TypedDict, total=False):
+    model_ref: Dict[str, str]  # {"type":"modelhub_id"|"path","value":"..."}
+    target_runtime: str
+    target_soc: str
+    precision: str
+    quantization: str
+    project_id: str
+    config: Dict[str, Any]
+
+
+class ConverterError(TypedDict, total=False):
+    code: str
+    message: str
+    where: Literal["planner", "compiler", "executor"]
+    step_id: Optional[str]
+
+
+class ConverterState(TypedDict, total=False):
+    # identity/context
+    session_id: str
+    user_id: str
+
+    # in
+    conversion_request: ConversionRequest
+    recent_chat_summary: str
+
+    # run/workspace
+    run_id: str
+    workspace_root: str
+    workspace_input_model: str  # relpath under workspace
+
+    # qairt registry snapshot
+    qairt_tool_catalog: List[Dict[str, Any]]
+
+    # planner output
+    plan: Dict[str, Any]  # validated into pydantic in compiler
+
+    # compiled plan for executor
+    compiled_steps: List[Dict[str, Any]]
+
+    # loopback controls
+    replan_count: int
+    max_replans: int
+    replan_needed: bool
+    planner_feedback: str
+    last_error: ConverterError
+
+    # final
+    conversion_result: Dict[str, Any]
+    last_experiment_id: str
+
+
+agentic_suite/agents/converter/schemas.py
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
-# -----------------------
-# Planner input
-# -----------------------
-
-class ToolCatalogEntry(BaseModel):
-    name: str
-    category: str
-    source: Optional[str] = None
-    target: Optional[str] = None
-    accelerator: Optional[str] = None
-    sdk: Optional[str] = None
-    description: Optional[str] = None
-    tags: List[str] = Field(default_factory=list)
-
-
-class PreviousExperimentSummary(BaseModel):
-    experiment_id: str
-    status: str
-    model_id: Optional[str] = None
-    artifacts: List[Dict[str, str]] = Field(default_factory=list)
-    intent: Optional[Dict[str, Any]] = None
-    notes: Optional[str] = None
-
-
-class ModelRef(BaseModel):
-    type: Literal["modelhub_id", "path"]
-    value: str
-
-
-class ResolvedModelInfo(BaseModel):
-    model_id: str
-    filename: str
-    absolute_path: str
-    # optional extras
-    framework: Optional[str] = None
-    format: Optional[str] = None
-
-
-class ConversionContext(BaseModel):
-    session_id: str
-    user: str
-    latest_user_message: str
-    recent_chat_summary: Optional[str] = None
-
-    model_ref: ModelRef
-    resolved_model: Optional[ResolvedModelInfo] = None
-
-    tool_catalog: List[ToolCatalogEntry] = Field(default_factory=list)
-    previous_experiments: List[PreviousExperimentSummary] = Field(default_factory=list)
-
-    default_policy_bucket: Literal["safe", "balanced", "fast", "max_perf"] = "balanced"
-    constraints: Dict[str, Any] = Field(default_factory=dict)
-    hints: Dict[str, Any] = Field(default_factory=dict)
-
-
-# -----------------------
-# Planner output IR
-# -----------------------
-
-class IntentIR(BaseModel):
-    model_ref: ModelRef
-    source_framework: Literal["tensorflow", "pytorch", "onnx", "tflite"]
-    target_runtime: Literal["snpe", "qnn", "tflite", "mdla"]
-    target_soc: str
-    precision: Literal["fp32", "fp16", "int8"] = "fp16"
-    quantization: Literal["none", "static", "dynamic"] = "none"
-
-
-class ToolSelector(BaseModel):
-    category: Literal["conversion", "caching", "validation", "export"]
-    source: Optional[str] = None
-    target: Optional[str] = None
-    accelerator: Optional[str] = None
-    tags_all: List[str] = Field(default_factory=list)
-    tags_any: List[str] = Field(default_factory=list)
-    sdk: Optional[str] = None
-
-
-class StepIO(BaseModel):
-    inputs: Dict[str, str] = Field(default_factory=dict)   # workspace-relative
-    outputs: Dict[str, str] = Field(default_factory=dict)  # workspace-relative
-
-
-class StepIR(BaseModel):
+class PlanStep(BaseModel):
     step_id: str
-    op: Literal["convert_model", "cache_model", "validate_model", "export_artifacts"]
-    tool_selector: ToolSelector
-    io: StepIO = Field(default_factory=StepIO)
-    params: Dict[str, Any] = Field(default_factory=dict)  # intent-level knobs only
-    policy_bucket: Optional[Literal["safe", "balanced", "fast", "max_perf"]] = None
+    tool_name: str
+
+    required_args: Dict[str, Any] = Field(default_factory=dict)
+    optional_args: Dict[str, Any] = Field(default_factory=dict)
+
+    # workspace-relative paths for validations
+    expected_outputs: List[str] = Field(default_factory=list)
     depends_on: List[str] = Field(default_factory=list)
 
 
-class NeedsInput(BaseModel):
-    questions: List[str]
-    missing_fields: List[str] = Field(default_factory=list)
+class ConversionPlan(BaseModel):
+    status: Literal["OK", "NEEDS_INPUT"]
 
-
-class ConversionPlanIR(BaseModel):
-    plan_version: str = "1"
-    status: Literal["OK", "NEEDS_INPUT"] = "OK"
-    needs_input: Optional[NeedsInput] = None
-    intent: IntentIR
-    steps: List[StepIR] = Field(default_factory=list)
+    questions: List[str] = Field(default_factory=list)  # when NEEDS_INPUT
+    intent: Dict[str, Any] = Field(default_factory=dict)
+    steps: List[PlanStep] = Field(default_factory=list)
     rationale: Optional[str] = None
 
 
-# -----------------------
-# Compiled plan (deterministic)
-# -----------------------
-
 class CompiledStep(BaseModel):
     step_id: str
-    op: str
     tool_name: str
-    tool_category: str
-
     args: Dict[str, Any] = Field(default_factory=dict)
-    abs_inputs: Dict[str, str] = Field(default_factory=dict)
-    abs_outputs: Dict[str, str] = Field(default_factory=dict)
 
+    expected_outputs: List[str] = Field(default_factory=list)  # absolute paths
     depends_on: List[str] = Field(default_factory=list)
-    expected_outputs: List[str] = Field(default_factory=list)
 
-    skip_if_outputs_exist: bool = True
-    validations: List[Dict[str, Any]] = Field(default_factory=list)
-
-
-class CompiledPlan(BaseModel):
-    compiled_version: str = "1"
-    experiment_id: str
-    workspace_root: str
-
-    intent: Dict[str, Any]
-    tool_catalog_snapshot: List[Dict[str, Any]] = Field(default_factory=list)
-
-    steps: List[CompiledStep] = Field(default_factory=list)
-
-    policy_version: Optional[str] = None
-    compiler_metadata: Dict[str, Any] = Field(default_factory=dict)
-
-
-# -----------------------
-# Result (for main graph)
-# -----------------------
 
 class ConversionResult(BaseModel):
-    experiment_id: str
     status: Literal["COMPLETED", "FAILED", "NEEDS_INPUT"]
-    artifacts: List[Dict[str, str]] = Field(default_factory=list)
-    error: Optional[str] = None
-    needs_input: Optional[NeedsInput] = None
+    run_id: str
+    workspace_root: Optional[str] = None
+    artifacts: List[Dict[str, Any]] = Field(default_factory=list)
+    questions: List[str] = Field(default_factory=list)
+    error: Optional[Dict[str, Any]] = None
+    timestamp: str
 
-
--------///
-
-CONVERTER_PLANNER_SYSTEM = """\
-You are ConverterPlanner.
-
-Goal:
-Produce a ConversionPlanIR that converts a model to the requested target runtime and SoC.
-
-You are a ReAct-style planner. You may call ONLY these tools:
-- list_tools
-- get_tool_spec
-- modelhub_get_model / modelhub_get_by_path (optional)
-
-Rules:
-- Never call run_tool or execute conversion.
-- Never output CLI flags directly; work at intent/policy level.
-- Prefer semantic tool selection via tool_selector; do not hardcode tool names.
-- All inputs/outputs in the plan must be workspace-relative paths (no absolute paths, no .. traversal).
-- If info is missing, return NEEDS_INPUT with specific questions.
-- If multiple tools match, refine selector or return NEEDS_INPUT/ambiguity.
-
-Output:
-Return ONE JSON object matching ConversionPlanIR. No extra text.
-"""
-
------/////
-
-
-from __future__ import annotations
-
-from typing import Any, Dict, List, Protocol
-
-
-class AsyncTool(Protocol):
-    name: str
-    async def ainvoke(self, input: Dict[str, Any]) -> Any: ...
-
-
-class ModelHubClient:
-    def __init__(self, get_model_tool: AsyncTool, get_by_path_tool: AsyncTool):
-        self._get_model = get_model_tool
-        self._get_by_path = get_by_path_tool
-
-    async def get_model(self, model_id: str) -> Dict[str, Any]:
-        return await self._get_model.ainvoke({"model_id": model_id})
-
-    async def get_by_path(self, file_path: str) -> Dict[str, Any]:
-        return await self._get_by_path.ainvoke({"file_path": file_path})
-
-
-class SnpeRegistryClient:
-    def __init__(self, list_tools: AsyncTool, get_tool_spec: AsyncTool, run_tool: AsyncTool):
-        self._list_tools = list_tools
-        self._get_tool_spec = get_tool_spec
-        self._run_tool = run_tool
-
-    async def list_tools(self) -> List[Dict[str, Any]]:
-        return await self._list_tools.ainvoke({})
-
-    async def get_tool_spec(self, tool_name: str, view: str) -> Dict[str, Any]:
-        return await self._get_tool_spec.ainvoke({"tool_name": tool_name, "view": view})
-
-    async def run_tool(self, tool_name: str, args: Dict[str, Any], workspace_root: str) -> Dict[str, Any]:
-        return await self._run_tool.ainvoke({"tool_name": tool_name, "args": args, "workspace_root": workspace_root})
-
-
-
---------////
+agentic_suite/agents/converter/deps.py
 
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+import os
+import re
+import shutil
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
 
-from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AIMessage
-from pydantic import ValidationError
+from langchain_core.messages import BaseMessage
 
-from .schemas import ConversionContext, ConversionPlanIR
-from .prompts import CONVERTER_PLANNER_SYSTEM
+from agentic_logging import get_logger
+from tool_manager import ToolManager, get_toolset_signature
+
+logger = get_logger("converter.deps")
 
 
-def _extract_json_object(text: str) -> Dict[str, Any]:
-    """
-    Robust-ish JSON extraction:
-    - if model returns pure JSON, json.loads works
-    - otherwise, find first '{' and last '}' and parse
-    """
-    text = text.strip()
+def now_utc_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def normalize_tool_key(name: str) -> str:
+    # tolerate "namespace: tool" vs "namespace:tool"
+    return re.sub(r"\s*:\s*", ":", name.strip())
+
+
+def unwrap_tool(obj: Any) -> Any:
+    # ToolManager.get_tool may return EnrichedTool or tool
+    if obj is None:
+        return None
+    return getattr(obj, "tool", obj)
+
+
+def get_tool_handle(tool_manager: ToolManager, namespaced_key: str) -> Any:
+    key = normalize_tool_key(namespaced_key)
+    t = tool_manager.get_tool(key)
+    if t is None:
+        # try spacing variant
+        t = tool_manager.get_tool(key.replace(":", ": "))
+    tool = unwrap_tool(t)
+    if tool is None:
+        raise RuntimeError(f"Tool not found in catalog: {namespaced_key}")
+    return tool
+
+
+def safe_join(workspace_root: str, rel: str) -> str:
+    if os.path.isabs(rel):
+        raise ValueError(f"Absolute paths are not allowed in plan args: {rel}")
+    norm = os.path.normpath(rel)
+    if norm.startswith("..") or "/../" in norm.replace("\\", "/"):
+        raise ValueError(f"Path traversal not allowed: {rel}")
+
+    abs_path = os.path.abspath(os.path.join(workspace_root, norm))
+    root_abs = os.path.abspath(workspace_root)
+    if not abs_path.startswith(root_abs + os.sep) and abs_path != root_abs:
+        raise ValueError(f"Path escapes workspace root: {rel}")
+    return abs_path
+
+
+def extract_json_object(text: str) -> Dict[str, Any]:
+    text = (text or "").strip()
     try:
         return json.loads(text)
     except Exception:
         start = text.find("{")
         end = text.rfind("}")
         if start == -1 or end == -1 or end <= start:
-            raise ValueError("Planner did not return JSON")
-        return json.loads(text[start:end+1])
+            raise ValueError("Expected JSON object in planner output")
+        return json.loads(text[start:end + 1])
 
 
-class ConverterPlanner:
+def write_json(path: str, payload: Any) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def discover_artifacts(workspace_root: str) -> List[Dict[str, Any]]:
+    artifacts: List[Dict[str, Any]] = []
+    converted_dir = os.path.join(workspace_root, "converted")
+    if not os.path.isdir(converted_dir):
+        return artifacts
+
+    for root, _, files in os.walk(converted_dir):
+        for fn in files:
+            abs_path = os.path.join(root, fn)
+            rel = os.path.relpath(abs_path, workspace_root)
+            typ = "file"
+            if fn.endswith(".dlc"):
+                typ = "dlc"
+            artifacts.append({"type": typ, "path": rel})
+    return artifacts
+
+
+class ToolBindingCache:
     """
-    ReAct planner: LLM can call list_tools/get_tool_spec/modelhub tools to decide the plan.
-    """
-
-    def __init__(self, llm_with_tools, tools_by_name: Dict[str, Any], max_iters: int = 8):
-        self.llm = llm_with_tools
-        self.tools_by_name = tools_by_name
-        self.max_iters = max_iters
-
-    async def plan(self, ctx: ConversionContext) -> ConversionPlanIR:
-        messages: List[Any] = [
-            SystemMessage(content=CONVERTER_PLANNER_SYSTEM),
-            HumanMessage(content=json.dumps(ctx.model_dump(), indent=2)),
-        ]
-
-        for _ in range(self.max_iters):
-            ai: AIMessage = await self.llm.ainvoke(messages)
-            messages.append(ai)
-
-            # Tool calls?
-            tool_calls = getattr(ai, "tool_calls", None) or []
-            if tool_calls:
-                for tc in tool_calls:
-                    name = tc.get("name")
-                    args = tc.get("args") or {}
-                    if name not in self.tools_by_name:
-                        # respond with tool error message
-                        messages.append(ToolMessage(content=f"ERROR: unknown tool {name}", tool_call_id=tc.get("id")))
-                        continue
-                    tool = self.tools_by_name[name]
-                    result = await tool.ainvoke(args)
-                    messages.append(ToolMessage(content=json.dumps(result), tool_call_id=tc.get("id")))
-                continue
-
-            # No tool calls -> should be final JSON plan
-            payload = _extract_json_object(ai.content or "")
-            try:
-                return ConversionPlanIR.model_validate(payload)
-            except ValidationError as e:
-                # Feed error back and ask to re-emit valid JSON
-                messages.append(
-                    HumanMessage(
-                        content=(
-                            "Your previous output was not valid ConversionPlanIR JSON.\n"
-                            f"Validation error:\n{e}\n\n"
-                            "Re-emit ONLY valid ConversionPlanIR JSON."
-                        )
-                    )
-                )
-
-        raise RuntimeError("Planner exceeded max tool iterations without producing a valid plan")
-
-
------///
-
-
-from __future__ import annotations
-
-import os
-from typing import Any, Dict, List, Tuple
-
-from .schemas import ConversionPlanIR, CompiledPlan, CompiledStep, ToolCatalogEntry
-from .tool_facades import SnpeRegistryClient
-from .config import ConverterPolicyConfig
-
-
-class CompileError(RuntimeError):
-    def __init__(self, code: str, message: str):
-        super().__init__(f"{code}: {message}")
-        self.code = code
-        self.message = message
-
-
-def _is_safe_relpath(p: str) -> bool:
-    if not p or os.path.isabs(p):
-        return False
-    norm = os.path.normpath(p)
-    return not (norm.startswith("..") or "/../" in norm.replace("\\", "/"))
-
-
-def _resolve_selector(catalog: List[Dict[str, Any]], selector: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Deterministically match a tool from list_tools() output.
-    """
-    matches = []
-    for t in catalog:
-        if t.get("category") != selector.get("category"):
-            continue
-        if selector.get("source") and t.get("source") != selector.get("source"):
-            continue
-        if selector.get("target") and t.get("target") != selector.get("target"):
-            continue
-        if selector.get("accelerator") and t.get("accelerator") != selector.get("accelerator"):
-            continue
-        if selector.get("sdk") and t.get("sdk") != selector.get("sdk"):
-            continue
-
-        tags_all = selector.get("tags_all") or []
-        tags_any = selector.get("tags_any") or []
-        tool_tags = set(t.get("tags") or [])
-
-        if tags_all and not set(tags_all).issubset(tool_tags):
-            continue
-        if tags_any and not set(tags_any).intersection(tool_tags):
-            continue
-
-        matches.append(t)
-
-    if not matches:
-        raise CompileError("NO_TOOL_MATCH", f"Selector {selector} matched 0 tools")
-    if len(matches) > 1:
-        raise CompileError("AMBIGUOUS_TOOL_MATCH", f"Selector {selector} matched multiple tools: {[m.get('name') for m in matches]}")
-    return matches[0]
-
-
-def _spec_arg_names(spec: Dict[str, Any]) -> List[str]:
-    return [a.get("name") for a in (spec.get("args") or []) if a.get("name")]
-
-
-def _map_required_args(required_spec: Dict[str, Any], abs_inputs: Dict[str, str], abs_outputs: Dict[str, str]) -> Dict[str, Any]:
-    """
-    Conservative mapping: fill required I/O args based on name patterns.
-    If your tool naming conventions differ, update this function.
-    """
-    args = {}
-    for a in (required_spec.get("args") or []):
-        name = a.get("name")
-        if not name:
-            continue
-        n = name.lower()
-
-        if ("input" in n and "model" in n) or name in ("input_model", "model", "input"):
-            # Prefer 'model' input key if present
-            if "model" in abs_inputs:
-                args[name] = abs_inputs["model"]
-            else:
-                # fallback: first input
-                args[name] = next(iter(abs_inputs.values()))
-            continue
-
-        if ("output" in n and ("dlc" in n or "model" in n)) or name in ("output_dlc", "output_model", "out"):
-            if "dlc" in abs_outputs:
-                args[name] = abs_outputs["dlc"]
-            else:
-                args[name] = next(iter(abs_outputs.values()))
-            continue
-
-        # Refuse to guess non-I/O required args
-        raise CompileError("REQUIRED_ARG_UNMAPPED", f"Unhandled required arg '{name}' (update compiler mapping)")
-    return args
-
-
-class PlanCompiler:
-    """
-    Deterministically compiles ConversionPlanIR into CompiledPlan:
-    - resolves selectors -> tool_name
-    - validates tool specs
-    - expands policy bucket to optional args
-    - sandboxes IO paths
+    Mirrors your ChatAgent approach:
+      llm.bind_tools(tools) cached by (mode, signature).
     """
 
-    def __init__(self, snpe: SnpeRegistryClient, policy: ConverterPolicyConfig):
-        self.snpe = snpe
-        self.policy = policy
+    def __init__(self, llm: Any, tool_manager: ToolManager):
+        self.llm = llm
+        self.tool_manager = tool_manager
+        self._cache: Dict[Tuple[str, int], Any] = {}
 
-    async def compile(
-        self,
-        *,
-        plan_ir: ConversionPlanIR,
-        experiment_id: str,
-        workspace_root: str,
-        tool_catalog_snapshot: List[Dict[str, Any]],
-    ) -> CompiledPlan:
-        steps: List[CompiledStep] = []
-
-        # Validate IR relpaths
-        for s in plan_ir.steps:
-            for p in list(s.io.inputs.values()) + list(s.io.outputs.values()):
-                if not _is_safe_relpath(p):
-                    raise CompileError("PATH_ESCAPE", f"Unsafe workspace-relative path: {p}")
-
-        runtime = plan_ir.intent.target_runtime
-
-        for step in plan_ir.steps:
-            selector = step.tool_selector.model_dump()
-            tool_entry = _resolve_selector(tool_catalog_snapshot, selector)
-            tool_name = tool_entry["name"]
-
-            # derive absolute IO
-            abs_inputs = {k: os.path.join(workspace_root, v) for k, v in step.io.inputs.items()}
-            abs_outputs = {k: os.path.join(workspace_root, v) for k, v in step.io.outputs.items()}
-
-            # fetch specs
-            req_spec = await self.snpe.get_tool_spec(tool_name, "required")
-            opt_spec = await self.snpe.get_tool_spec(tool_name, "optional")
-
-            req_names = set(_spec_arg_names(req_spec))
-            opt_names = set(_spec_arg_names(opt_spec))
-
-            # required args mapping
-            required_args = _map_required_args(req_spec, abs_inputs, abs_outputs)
-
-            # optional args from: intent + policy bucket + step params (high-level only)
-            bucket = step.policy_bucket or plan_ir.intent.model_dump().get("policy_bucket")  # not present but safe
-            bucket = bucket or "balanced"
-
-            policy_args = self.policy.buckets.get(runtime, {}).get(step.op, {}).get(bucket, {})
-            # intent-level allowed knobs
-            intent_args = {}
-            if "precision" in opt_names:
-                intent_args["precision"] = plan_ir.intent.precision
-            if plan_ir.intent.quantization != "none" and "quantization" in opt_names:
-                intent_args["quantization"] = plan_ir.intent.quantization
-
-            # step params (still validated against opt spec)
-            step_params = {}
-            for k, v in (step.params or {}).items():
-                if k in opt_names:
-                    step_params[k] = v
-
-            optional_args = {}
-            for src in (policy_args, intent_args, step_params):
-                for k, v in src.items():
-                    if k in opt_names:
-                        optional_args[k] = v
-
-            # final args validation: required keys must exist
-            for k in required_args.keys():
-                if k not in req_names:
-                    raise CompileError("REQ_ARG_NOT_IN_SPEC", f"Required arg '{k}' not in required spec for {tool_name}")
-
-            # optional keys must exist
-            unknown_opt = [k for k in optional_args.keys() if k not in opt_names]
-            if unknown_opt:
-                raise CompileError("ARG_NOT_SUPPORTED", f"Optional args not supported by {tool_name}: {unknown_opt}")
-
-            expected_outputs = list(abs_outputs.values())
-            validations = [{"type": "file_exists", "path": p} for p in expected_outputs]
-
-            steps.append(
-                CompiledStep(
-                    step_id=step.step_id,
-                    op=step.op,
-                    tool_name=tool_name,
-                    tool_category=tool_entry.get("category", "unknown"),
-                    args={**required_args, **optional_args},
-                    abs_inputs=abs_inputs,
-                    abs_outputs=abs_outputs,
-                    depends_on=step.depends_on,
-                    expected_outputs=expected_outputs,
-                    validations=validations,
-                )
-            )
-
-        return CompiledPlan(
-            experiment_id=experiment_id,
-            workspace_root=workspace_root,
-            intent=plan_ir.intent.model_dump(),
-            tool_catalog_snapshot=tool_catalog_snapshot,
-            steps=steps,
-            policy_version=self.policy.policy_version,
-            compiler_metadata={"compiled_from_plan_version": plan_ir.plan_version},
-        )
+    def get_llm_for_mode(self, mode: str) -> Any:
+        tools = self.tool_manager.get_tools_for_mode(mode)
+        signature = get_toolset_signature(tools)
+        key = (mode, signature)
+        if key not in self._cache:
+            logger.info(f"Binding tools for mode='{mode}' signature={signature}")
+            self._cache[key] = self.llm.bind_tools(tools)
+        return self._cache[key]
 
 
+agentic_suite/agents/converter/prompts/converter_planner.md
 
-------////
+You are ConverterPlanner.
+
+You are planning a model conversion using QAIRT tools (SNPE/QNN).
+You may call tools to fetch tool lists and tool specs.
+
+CRITICAL RULES:
+- NEVER call any execution tool that runs conversion (e.g., qairt_run). Planning only.
+- Use tools only to understand available conversion tools and their required args.
+- Your output MUST be a single JSON object (no markdown) matching the required schema below.
+
+INPUT:
+You will receive a JSON context containing:
+- conversion_request (user intent)
+- workspace_root (absolute)
+- workspace_input_model (workspace-relative path to input model)
+- qairt_tool_catalog (list of available QAIRT tools; may be empty if not fetched yet)
+- last_error / planner_feedback if this is a replan attempt
+
+YOUR OUTPUT SCHEMA:
+{
+  "status": "OK" | "NEEDS_INPUT",
+  "questions": [ ... ],                 // if NEEDS_INPUT
+  "intent": { ... },                    // summarize intent (target_runtime, target_soc, precision...)
+  "steps": [
+    {
+      "step_id": "convert",
+      "tool_name": "<UNDERLYING_QAIRT_TOOL_NAME>",
+      "required_args": { "<arg>": "<value>", ... },
+      "optional_args": { "<arg>": "<value>", ... },
+      "expected_outputs": [ "converted/model.dlc", ... ],
+      "depends_on": []
+    }
+  ],
+  "rationale": "short reason"
+}
+
+IMPORTANT PATH RULES:
+- Any file/dir args MUST be workspace-relative (examples: "input/model.onnx", "converted/model.dlc", "converted/cached/htp").
+- Do NOT use absolute paths in required_args/optional_args.
+
+REQUIRED ARGS:
+- You MUST fetch qairt_get_tool_spec(view="required") for the chosen tool_name.
+- Populate ALL required args exactly (names must match spec).
+- Use workspace_input_model for the model input path whenever applicable.
+
+REPLAN:
+- If planner_feedback says the compiler/executor failed, adjust the plan accordingly.
+
+agentic_suite/agents/converter/planner.py
 
 
 from __future__ import annotations
@@ -626,629 +325,628 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Protocol
+import uuid
+from typing import Any, Dict, List
 
-from .schemas import CompiledPlan, ConversionResult
-from .tool_facades import ModelHubClient, SnpeRegistryClient
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
+from langgraph.prebuilt import ToolNode
 
+from agentic_logging import get_logger
+from .config import ConverterConfig
+from .state import ConverterState
+from .deps import (
+    now_utc_iso,
+    extract_json_object,
+    get_tool_handle,
+    write_json,
+    ToolBindingCache,
+)
 
-class ExperimentService(Protocol):
-    def create(self, **kwargs) -> None: ...
-    def update_status(self, experiment_id: str, status: str, error: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> None: ...
-    def add_artifacts(self, experiment_id: str, artifacts: List[Dict[str, str]]) -> None: ...
-
-
-def _ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def _write_json(path: str, payload: Dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
+logger = get_logger("converter.planner")
 
 
-def _write_text(path: str, text: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+def load_planner_prompt(config: ConverterConfig) -> str:
+    if config.planner_prompt_path and os.path.exists(config.planner_prompt_path):
+        with open(config.planner_prompt_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    # fallback to packaged prompt file path relative to this file
+    prompt_path = os.path.join(os.path.dirname(__file__), "prompts", "converter_planner.md")
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        return f.read()
 
 
-def _relpath(root: str, abs_path: str) -> str:
-    return os.path.relpath(abs_path, root)
-
-
-def _validate_file_exists(path: str) -> None:
-    if not os.path.exists(path):
-        raise RuntimeError(f"Validation failed: file not found: {path}")
-
-
-class PlanExecutor:
+class PlannerNode:
     """
-    Deterministic execution:
-    - resolve model
-    - create experiment + workspace
-    - execute compiled steps sequentially using run_tool
-    - persist logs + artifacts + statuses
+    Planner node does two things:
+      1) Deterministic init (run creation + workspace + input model copy) if not done.
+      2) ReAct planning using ToolNode (LLM tool calling) -> produces plan JSON in state["plan"].
+
+    Tool execution happens via ToolNode created from ToolManager tools for mode=config.tool_mode.
     """
 
     def __init__(
         self,
         *,
-        modelhub: ModelHubClient,
-        snpe: SnpeRegistryClient,
-        experiments: ExperimentService,
-        experiments_root: str,
+        llm_cache: ToolBindingCache,
+        tool_manager: Any,
+        config: ConverterConfig,
     ):
-        self.modelhub = modelhub
-        self.snpe = snpe
-        self.experiments = experiments
-        self.experiments_root = experiments_root
+        self.llm_cache = llm_cache
+        self.tool_manager = tool_manager
+        self.config = config
+        self.prompt = load_planner_prompt(config)
 
-    async def resolve_model(self, model_ref: Dict[str, str]) -> Dict[str, Any]:
-        if model_ref["type"] == "modelhub_id":
-            return await self.modelhub.get_model(model_ref["value"])
-        return await self.modelhub.get_by_path(model_ref["value"])
+    async def __call__(self, state: ConverterState) -> ConverterState:
+        session_id = state.get("session_id", "unknown")
+        state.setdefault("replan_count", 0)
+        state.setdefault("max_replans", self.config.max_replans)
+        state["replan_needed"] = False
 
-    def create_workspace(self, user: str, experiment_id: str) -> Dict[str, str]:
-        root = os.path.join(self.experiments_root, user, experiment_id)
-        paths = {
-            "root": root,
-            "input": os.path.join(root, "input"),
-            "converted": os.path.join(root, "converted"),
-            "logs": os.path.join(root, "logs"),
+        # deterministic init
+        if not state.get("run_id"):
+            await self._init_run_and_workspace(state)
+
+        # preload qairt tool catalog (helpful for planner; not required)
+        if not state.get("qairt_tool_catalog"):
+            try:
+                qairt_list = get_tool_handle(self.tool_manager, self.config.tools.qairt_list_tools)
+                catalog = await qairt_list.ainvoke({})
+                if isinstance(catalog, dict) and "tools" in catalog:
+                    catalog = catalog["tools"]
+                state["qairt_tool_catalog"] = catalog if isinstance(catalog, list) else []
+            except Exception as e:
+                logger.warning(f"[{session_id}] Could not preload qairt tool catalog: {e}")
+                state["qairt_tool_catalog"] = []
+
+        # If a previous node asked for replan, planner_feedback is set
+        ctx = {
+            "session_id": session_id,
+            "user_id": state.get("user_id"),
+            "conversion_request": state.get("conversion_request", {}),
+            "workspace_root": state.get("workspace_root"),
+            "workspace_input_model": state.get("workspace_input_model"),
+            "qairt_tool_catalog": state.get("qairt_tool_catalog", []),
+            "replan_count": state.get("replan_count", 0),
+            "last_error": state.get("last_error"),
+            "planner_feedback": state.get("planner_feedback"),
         }
-        for p in paths.values():
-            _ensure_dir(p)
-        return paths
 
-    def copy_model_to_workspace(self, model: Dict[str, Any], ws: Dict[str, str]) -> str:
-        src = model["absolute_path"]
-        dst = os.path.join(ws["input"], model["filename"])
-        shutil.copy2(src, dst)
-        return dst
+        llm = self.llm_cache.get_llm_for_mode(self.config.tool_mode)
+        tool_node = ToolNode(self.tool_manager.get_tools_for_mode(self.config.tool_mode))
 
-    async def run(self, *, user: str, experiment_id: str, compiled: CompiledPlan, model: Dict[str, Any]) -> ConversionResult:
-        ws_root = compiled.workspace_root
-        logs_dir = os.path.join(ws_root, "logs")
-        _ensure_dir(logs_dir)
+        messages: List[BaseMessage] = [
+            SystemMessage(content=self.prompt),
+            HumanMessage(content=json.dumps(ctx, indent=2)),
+        ]
 
-        self.experiments.update_status(experiment_id, "EXECUTING")
+        for _ in range(self.config.planner_max_tool_iters):
+            ai: AIMessage = await llm.ainvoke(messages)
+            messages.append(ai)
 
-        # Execute steps in order (compiler already set)
-        for step in compiled.steps:
-            step_log_prefix = os.path.join(logs_dir, f"{step.step_id}")
-
-            # Idempotence: skip if outputs exist
-            if step.skip_if_outputs_exist and step.expected_outputs and all(os.path.exists(p) for p in step.expected_outputs):
-                _write_text(f"{step_log_prefix}.skipped.txt", "Skipped: outputs already exist\n")
+            tool_calls = getattr(ai, "tool_calls", None) or []
+            if tool_calls:
+                tool_out = await tool_node.ainvoke({"messages": messages})
+                tool_messages = tool_out.get("messages", [])
+                if tool_messages:
+                    messages.extend(tool_messages)
                 continue
 
-            self.experiments.update_status(experiment_id, f"STEP_RUNNING:{step.step_id}")
+            # final plan JSON
+            payload = extract_json_object(ai.content or "")
+            state["plan"] = payload
+            return state
 
-            exec_result = await self.snpe.run_tool(
-                tool_name=step.tool_name,
-                args=step.args,
-                workspace_root=ws_root,
-            )
+        # max iters
+        state["last_error"] = {"code": "PLANNER_MAX_ITERS", "message": "Planner exceeded max tool iterations", "where": "planner"}
+        state["conversion_result"] = {
+            "status": "FAILED",
+            "run_id": state.get("run_id", ""),
+            "error": state["last_error"],
+            "timestamp": now_utc_iso(),
+        }
+        state["last_experiment_id"] = state.get("run_id", "")
+        return state
 
-            _write_json(f"{step_log_prefix}.exec_result.json", exec_result)
-            _write_text(f"{step_log_prefix}.stdout.txt", str(exec_result.get("stdout", "")))
-            _write_text(f"{step_log_prefix}.stderr.txt", str(exec_result.get("stderr", "")))
+    async def _init_run_and_workspace(self, state: ConverterState) -> None:
+        """
+        Deterministic init:
+          - resolve model from ModelHub
+          - create run in experiments
+          - create workspace dirs
+          - copy model into workspace/input
+        """
+        req = state.get("conversion_request") or {}
+        model_ref = req.get("model_ref") or {}
+        if "type" not in model_ref or "value" not in model_ref:
+            raise RuntimeError("conversion_request.model_ref must be {type,value}")
 
-            exit_code = exec_result.get("exit_code", 0)
-            if exit_code not in (0, "0", None):
-                raise RuntimeError(f"Step {step.step_id} failed (exit_code={exit_code}). Check logs.")
+        user_id = state.get("user_id") or "default_user"
 
-            # Validations
-            for v in step.validations:
-                if v.get("type") == "file_exists":
-                    _validate_file_exists(v["path"])
+        mh_get_model = get_tool_handle(self.tool_manager, self.config.tools.modelhub_get_model)
+        mh_get_by_path = get_tool_handle(self.tool_manager, self.config.tools.modelhub_get_by_path)
 
-        # Artifact discovery: simple baseline (dlc if exists)
-        artifacts = []
-        dlc_candidate = None
-        for st in compiled.steps:
-            for outp in st.abs_outputs.values():
-                if outp.endswith(".dlc") and os.path.exists(outp):
-                    dlc_candidate = outp
-                    break
+        if model_ref["type"] == "modelhub_id":
+            model = await mh_get_model.ainvoke({"model_id": model_ref["value"]})
+        else:
+            model = await mh_get_by_path.ainvoke({"file_path": model_ref["value"]})
 
-        if dlc_candidate:
-            artifacts.append({"type": "dlc", "path": _relpath(ws_root, dlc_candidate)})
+        model_id = model.get("id") or model.get("model_id") or model.get("name") or "unknown_model"
+        filename = model.get("filename") or os.path.basename(model.get("absolute_path", "")) or "model.bin"
+        abs_path = model.get("absolute_path") or model.get("path")
+        if not abs_path:
+            raise RuntimeError(f"ModelHub response missing absolute_path/path. Keys={list(model.keys())}")
 
-        self.experiments.add_artifacts(experiment_id, artifacts)
-        self.experiments.update_status(experiment_id, "COMPLETED")
+        exp_create = get_tool_handle(self.tool_manager, self.config.tools.experiments_create_run)
+        exp_update = get_tool_handle(self.tool_manager, self.config.tools.experiments_update_run_status)
 
-        return ConversionResult(experiment_id=experiment_id, status="COMPLETED", artifacts=artifacts)
+        run_cfg = {
+            "conversion_request": req,
+            "model_ref": model_ref,
+            "model_id": model_id,
+            "created_at": now_utc_iso(),
+        }
 
-    async def run_safe(self, *, user: str, experiment_id: str, compiled: CompiledPlan, model: Dict[str, Any]) -> ConversionResult:
+        resp = await exp_create.ainvoke({
+            "run_type": "convert",
+            "user_id": user_id,
+            "config": run_cfg,
+            "project_id": req.get("project_id"),
+            "model_id": model_id,
+        })
+
+        run_id = resp.get("run_id") or resp.get("id") or str(uuid.uuid4())
+        state["run_id"] = run_id
+        state["last_experiment_id"] = run_id
+
+        workspace_root = os.path.join(self.config.experiments_root, user_id, run_id)
+        state["workspace_root"] = workspace_root
+
+        os.makedirs(os.path.join(workspace_root, "input"), exist_ok=True)
+        os.makedirs(os.path.join(workspace_root, "converted"), exist_ok=True)
+        os.makedirs(os.path.join(workspace_root, "logs"), exist_ok=True)
+
+        dst_abs = os.path.join(workspace_root, "input", filename)
+        shutil.copy2(abs_path, dst_abs)
+        state["workspace_input_model"] = os.path.relpath(dst_abs, workspace_root)
+
         try:
-            return await self.run(user=user, experiment_id=experiment_id, compiled=compiled, model=model)
-        except Exception as e:
-            # Best-effort error handling
-            ws_root = compiled.workspace_root
-            logs_dir = os.path.join(ws_root, "logs")
-            _ensure_dir(logs_dir)
-            _write_text(os.path.join(logs_dir, "failure.txt"), str(e))
-            self.experiments.update_status(experiment_id, "FAILED", error=str(e))
-            return ConversionResult(experiment_id=experiment_id, status="FAILED", error=str(e))
+            await exp_update.ainvoke({"run_id": run_id, "status": "WORKSPACE_READY", "error_message": None})
+        except Exception:
+            pass
 
+        write_json(os.path.join(workspace_root, "metadata.json"), {
+            "run_id": run_id,
+            "user_id": user_id,
+            "model_id": model_id,
+            "source_abs_path": abs_path,
+            "workspace_input_model": state["workspace_input_model"],
+            "created_at": now_utc_iso(),
+        })
 
-
-
------///
-
+agentic_suite/agents/converter/compiler.py
 
 from __future__ import annotations
 
 import os
-import json
-import uuid
-from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List
 
-from agents.converter_v2.config import ConverterConfig
-from agents.converter_v2.schemas import ConversionContext, ConversionPlanIR, ConversionResult, ResolvedModelInfo
-from agents.converter_v2.tool_facades import ModelHubClient, SnpeRegistryClient
-from agents.converter_v2.planner import ConverterPlanner
-from agents.converter_v2.compiler import PlanCompiler, CompileError
-from agents.converter_v2.executor import PlanExecutor
+from agentic_logging import get_logger
+from .config import ConverterConfig
+from .state import ConverterState
+from .schemas import ConversionPlan, CompiledStep
+from .deps import (
+    now_utc_iso,
+    get_tool_handle,
+    safe_join,
+    write_json,
+)
+
+logger = get_logger("converter.compiler")
 
 
-class ConverterAgentV2:
+class CompilerNode:
     """
-    Convert node for main orchestrator.
-
-    Inputs expected in main GraphState:
-      - state["conversion_request"] or state["conversion_intent"] (dict-like):
-          { model_ref: {...}, target_runtime, target_soc, precision? ... }
-      - state["session_id"] (recommended)
-      - state["user"] (optional)
-      - state["recent_chat_summary"] (optional)
-
-    Output:
-      - state["conversion_result"] : dict
-      - state["last_experiment_id"]: str
+    Deterministic compiler:
+      - Validates planner plan against tool spec
+      - Produces compiled_steps with absolute paths for args and outputs
+      - On failure sets replan_needed + planner_feedback (bounded in graph router)
     """
 
-    def __init__(
-        self,
-        *,
-        config: ConverterConfig,
-        llm_planner_with_tools,
-        tools_by_name: Dict[str, Any],
-        modelhub: ModelHubClient,
-        snpe: SnpeRegistryClient,
-        experiments: Any,
-        user_provider: Optional[Any] = None,
-    ):
+    def __init__(self, *, tool_manager: Any, config: ConverterConfig):
+        self.tool_manager = tool_manager
         self.config = config
-        self.tools_by_name = tools_by_name
 
-        # Planner gets only specific tools (you should pass only those in llm binding)
-        self.planner = ConverterPlanner(llm_planner_with_tools, tools_by_name, max_iters=config.planner_max_iters)
+    async def __call__(self, state: ConverterState) -> ConverterState:
+        state["replan_needed"] = False
 
-        # Compiler (deterministic)
-        self.compiler = PlanCompiler(snpe=snpe, policy=config.policy)
+        # If planner already produced a terminal result, skip
+        if state.get("conversion_result", {}).get("status") in ("FAILED", "NEEDS_INPUT", "COMPLETED"):
+            return state
 
-        # Executor (deterministic)
-        self.executor = PlanExecutor(
-            modelhub=modelhub,
-            snpe=snpe,
-            experiments=experiments,
-            experiments_root=config.paths.experiments_root,
-        )
+        workspace_root = state.get("workspace_root")
+        run_id = state.get("run_id")
+        if not workspace_root or not run_id:
+            return self._fail(state, "SPEC_MISSING", "workspace_root/run_id missing")
 
-        self.experiments = experiments
-        self.user_provider = user_provider
-        self.modelhub = modelhub
-        self.snpe = snpe
+        plan_raw = state.get("plan")
+        if not plan_raw:
+            return await self._loopback(state, "SPEC_MISSING", "plan missing from state")
 
-    async def __call__(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        # 0) user/session
-        user = None
-        if self.user_provider:
-            user = self.user_provider(state)
-        user = user or state.get("user") or "default_user"
-
-        session_id = state.get("session_id") or state.get("thread_id") or "session"
-
-        # 1) Extract request (you can unify naming)
-        req = state.get("conversion_request") or state.get("conversion_intent")
-        if not req:
-            raise RuntimeError("Missing conversion_request/conversion_intent in main state")
-
-        # must include model_ref
-        model_ref = req.get("model_ref") or {}
-        if "type" not in model_ref or "value" not in model_ref:
-            raise RuntimeError("conversion_request.model_ref must include {type,value}")
-
-        latest_user_message = state.get("latest_user_message") or state.get("last_user_message") or ""
-        recent_summary = state.get("recent_chat_summary")
-
-        # 2) Deterministic: resolve model + create experiment + workspace
-        experiment_id = str(uuid.uuid4())
-        ws_paths = self.executor.create_workspace(user=user, experiment_id=experiment_id)
-        ws_root = ws_paths["root"]
-
-        # Resolve model deterministically (so planner has correct metadata)
-        model = await self.executor.resolve_model(model_ref)
-        for k in ("id", "filename", "absolute_path"):
-            if k not in model:
-                raise RuntimeError(f"ModelHub model missing '{k}'. Keys: {list(model.keys())}")
-
-        copied_model_abs = self.executor.copy_model_to_workspace(model, ws_paths)
-
-        # DB record early
-        self.experiments.create(
-            experiment_id=experiment_id,
-            user=user,
-            model_id=model["id"],
-            target_runtime=req.get("target_runtime", "snpe"),
-            target_soc=req.get("target_soc", "unknown"),
-            status="CREATED",
-            created_at=datetime.utcnow(),
-            metadata={"planner": "react", "version": "v2"},
-            params=req,
-        )
-        self.experiments.update_status(experiment_id, "MATERIALIZED")
-
-        # 3) Deterministic: get tool catalog snapshot (lightweight)
-        tool_catalog = await self.snpe.list_tools()
-
-        # 4) Build planner context
-        ctx = ConversionContext(
-            session_id=session_id,
-            user=user,
-            latest_user_message=latest_user_message,
-            recent_chat_summary=recent_summary,
-            model_ref=model_ref,
-            resolved_model=ResolvedModelInfo(
-                model_id=model["id"],
-                filename=model["filename"],
-                absolute_path=model["absolute_path"],
-            ),
-            tool_catalog=tool_catalog,
-            previous_experiments=[],
-            default_policy_bucket="balanced",
-            constraints={"allow_experimental": False},
-            hints={"workspace_input_model": os.path.relpath(copied_model_abs, ws_root)},
-        )
-
-        # 5) Planner (LLM ReAct) -> Plan IR
+        # validate plan via pydantic
         try:
-            plan_ir: ConversionPlanIR = await self.planner.plan(ctx)
+            plan = ConversionPlan.model_validate(plan_raw)
         except Exception as e:
-            self.experiments.update_status(experiment_id, "FAILED", error=f"Planner failed: {e}")
-            state["conversion_result"] = ConversionResult(experiment_id=experiment_id, status="FAILED", error=str(e)).model_dump()
-            state["last_experiment_id"] = experiment_id
+            return await self._loopback(state, "PLAN_INVALID", f"plan schema invalid: {e}")
+
+        if plan.status == "NEEDS_INPUT":
+            state["conversion_result"] = {
+                "status": "NEEDS_INPUT",
+                "run_id": run_id,
+                "questions": plan.questions,
+                "timestamp": now_utc_iso(),
+            }
+            state["last_experiment_id"] = run_id
             return state
 
-        # NEEDS_INPUT -> return to chat
-        if plan_ir.status == "NEEDS_INPUT":
-            self.experiments.update_status(experiment_id, "NEEDS_INPUT", extra={"questions": plan_ir.needs_input.model_dump() if plan_ir.needs_input else None})
-            state["conversion_result"] = ConversionResult(
-                experiment_id=experiment_id,
-                status="NEEDS_INPUT",
-                needs_input=plan_ir.needs_input,
-            ).model_dump()
-            state["last_experiment_id"] = experiment_id
-            return state
+        if not plan.steps:
+            return await self._loopback(state, "SPEC_MISSING", "plan.steps empty")
 
-        # 6) Compile plan deterministically
+        qairt_get_spec = get_tool_handle(self.tool_manager, self.config.tools.qairt_get_tool_spec)
+
+        compiled: List[Dict[str, Any]] = []
         try:
-            compiled = await self.compiler.compile(
-                plan_ir=plan_ir,
-                experiment_id=experiment_id,
-                workspace_root=ws_root,
-                tool_catalog_snapshot=tool_catalog,
-            )
-        except CompileError as ce:
-            self.experiments.update_status(experiment_id, "FAILED", error=str(ce), extra={"code": ce.code})
-            state["conversion_result"] = ConversionResult(experiment_id=experiment_id, status="FAILED", error=str(ce)).model_dump()
-            state["last_experiment_id"] = experiment_id
+            for step in plan.steps:
+                req_spec = await qairt_get_spec.ainvoke({"tool_name": step.tool_name, "view": "required"})
+                opt_spec = await qairt_get_spec.ainvoke({"tool_name": step.tool_name, "view": "optional"})
+
+                req_names = [a.get("name") for a in (req_spec.get("args") or []) if a.get("name")]
+                missing = [n for n in req_names if n not in step.required_args]
+                if missing:
+                    raise ValueError(f"Step '{step.step_id}' missing required args: {missing}")
+
+                opt_names = {a.get("name") for a in (opt_spec.get("args") or []) if a.get("name")}
+                unknown_opt = [k for k in step.optional_args.keys() if k not in opt_names]
+                if unknown_opt:
+                    raise ValueError(f"Step '{step.step_id}' unsupported optional args: {unknown_opt}")
+
+                def compile_value(v: Any) -> Any:
+                    if isinstance(v, str):
+                        # treat as workspace-relative path by heuristic
+                        if (
+                            v.startswith(("input/", "converted/", "logs/"))
+                            or "/" in v or "\\" in v
+                            or v.endswith((".onnx", ".pb", ".tflite", ".dlc"))
+                        ):
+                            return safe_join(workspace_root, v)
+                    return v
+
+                args: Dict[str, Any] = {}
+                for k, v in step.required_args.items():
+                    args[k] = compile_value(v)
+                for k, v in step.optional_args.items():
+                    args[k] = compile_value(v)
+
+                expected_abs = [safe_join(workspace_root, p) for p in step.expected_outputs]
+
+                compiled_step = CompiledStep(
+                    step_id=step.step_id,
+                    tool_name=step.tool_name,
+                    args=args,
+                    expected_outputs=expected_abs,
+                    depends_on=step.depends_on,
+                )
+                compiled.append(compiled_step.model_dump())
+
+            state["compiled_steps"] = compiled
+
+            # persist plan and compiled info
+            write_json(os.path.join(workspace_root, "plan.json"), plan_raw)
+            write_json(os.path.join(workspace_root, "compiled_steps.json"), {"steps": compiled})
             return state
 
-        # Persist plan artifacts
-        with open(os.path.join(ws_root, "plan_ir.json"), "w", encoding="utf-8") as f:
-            json.dump(plan_ir.model_dump(), f, indent=2)
-        with open(os.path.join(ws_root, "compiled_plan.json"), "w", encoding="utf-8") as f:
-            json.dump(compiled.model_dump(), f, indent=2)
+        except Exception as e:
+            return await self._loopback(state, "COMPILER_ERROR", str(e))
 
-        # 7) Execute compiled plan deterministically
-        result = await self.executor.run_safe(user=user, experiment_id=experiment_id, compiled=compiled, model=model)
+    async def _loopback(self, state: ConverterState, code: str, message: str) -> ConverterState:
+        state["last_error"] = {"code": code, "message": message, "where": "compiler"}
+        state["replan_needed"] = True
+        state["planner_feedback"] = (
+            f"Compiler failed. code={code}. message={message}. "
+            "Fix the plan JSON: choose correct tool_name and ensure required_args match tool spec; "
+            "ensure workspace-relative paths."
+        )
+        return state
 
-        # Copy back to main state
-        state["conversion_result"] = result.model_dump()
-        state["last_experiment_id"] = experiment_id
+    def _fail(self, state: ConverterState, code: str, message: str) -> ConverterState:
+        run_id = state.get("run_id", "")
+        state["conversion_result"] = {
+            "status": "FAILED",
+            "run_id": run_id,
+            "error": {"code": code, "message": message, "where": "compiler"},
+            "timestamp": now_utc_iso(),
+        }
+        state["last_experiment_id"] = run_id
+        return state
+
+agentic_suite/agents/converter/executor.py
+
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List
+
+from agentic_logging import get_logger
+from .config import ConverterConfig
+from .state import ConverterState
+from .deps import (
+    now_utc_iso,
+    discover_artifacts,
+    get_tool_handle,
+    write_json,
+)
+
+logger = get_logger("converter.executor")
+
+
+class ExecutorNode:
+    """
+    Deterministic executor:
+      - Executes compiled steps sequentially using qairt_run
+      - Validates expected outputs
+      - Updates experiments status + attaches artifacts
+      - On execution failure sets replan_needed + planner_feedback (bounded in graph router)
+    """
+
+    def __init__(self, *, tool_manager: Any, config: ConverterConfig):
+        self.tool_manager = tool_manager
+        self.config = config
+
+    async def __call__(self, state: ConverterState) -> ConverterState:
+        state["replan_needed"] = False
+
+        # If terminal already, skip
+        if state.get("conversion_result", {}).get("status") in ("FAILED", "NEEDS_INPUT", "COMPLETED"):
+            return state
+
+        workspace_root = state.get("workspace_root")
+        run_id = state.get("run_id")
+        if not workspace_root or not run_id:
+            return self._fail(state, "SPEC_MISSING", "workspace_root/run_id missing")
+
+        compiled_steps = state.get("compiled_steps") or []
+        if not compiled_steps:
+            return await self._loopback(state, "SPEC_MISSING", "compiled_steps missing")
+
+        qairt_run = get_tool_handle(self.tool_manager, self.config.tools.qairt_run)
+        exp_update = get_tool_handle(self.tool_manager, self.config.tools.experiments_update_run_status)
+        exp_attach = get_tool_handle(self.tool_manager, self.config.tools.experiments_attach_artifacts)
+
+        logs_dir = os.path.join(workspace_root, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+
+        # best-effort set RUNNING
+        try:
+            await exp_update.ainvoke({"run_id": run_id, "status": "RUNNING", "error_message": None})
+        except Exception:
+            pass
+
+        try:
+            for step in compiled_steps:
+                step_id = step["step_id"]
+                tool_name = step["tool_name"]
+                args = step["args"]
+                expected_outputs = step.get("expected_outputs") or []
+
+                try:
+                    await exp_update.ainvoke({"run_id": run_id, "status": f"STEP:{step_id}", "error_message": None})
+                except Exception:
+                    pass
+
+                exec_result = await qairt_run.ainvoke({
+                    "tool_name": tool_name,
+                    "args": args,
+                    "workspace_root": workspace_root,
+                })
+
+                write_json(os.path.join(logs_dir, f"{step_id}.exec_result.json"), exec_result)
+
+                exit_code = exec_result.get("exit_code", 0)
+                if exit_code not in (0, "0", None):
+                    raise RuntimeError(f"Step '{step_id}' failed (exit_code={exit_code})")
+
+                for outp in expected_outputs:
+                    if not os.path.exists(outp):
+                        raise RuntimeError(f"Expected output missing after step '{step_id}': {outp}")
+
+            artifacts = discover_artifacts(workspace_root)
+
+            try:
+                await exp_attach.ainvoke({"run_id": run_id, "artifacts": artifacts})
+            except Exception:
+                pass
+
+            try:
+                await exp_update.ainvoke({"run_id": run_id, "status": "COMPLETED", "error_message": None})
+            except Exception:
+                pass
+
+            state["conversion_result"] = {
+                "status": "COMPLETED",
+                "run_id": run_id,
+                "workspace_root": workspace_root,
+                "artifacts": artifacts,
+                "timestamp": now_utc_iso(),
+            }
+            state["last_experiment_id"] = run_id
+            return state
+
+        except Exception as e:
+            return await self._loopback(state, "EXECUTOR_ERROR", str(e))
+
+    async def _loopback(self, state: ConverterState, code: str, message: str) -> ConverterState:
+        state["last_error"] = {"code": code, "message": message, "where": "executor"}
+        state["replan_needed"] = True
+        state["planner_feedback"] = (
+            f"Executor failed. code={code}. message={message}. "
+            "Fix the plan JSON (tool_name/args/expected_outputs). "
+            "Ensure expected_outputs are correct and paths are workspace-relative."
+        )
+        return state
+
+    def _fail(self, state: ConverterState, code: str, message: str) -> ConverterState:
+        run_id = state.get("run_id", "")
+        state["conversion_result"] = {
+            "status": "FAILED",
+            "run_id": run_id,
+            "error": {"code": code, "message": message, "where": "executor"},
+            "timestamp": now_utc_iso(),
+        }
+        state["last_experiment_id"] = run_id
+        return state
+
+agentic_suite/agents/converter/graph.py
+
+from __future__ import annotations
+
+from typing import Literal, Any
+
+from langgraph.graph import StateGraph, START, END
+
+from agentic_logging import get_logger
+from .state import ConverterState
+from .config import ConverterConfig
+from .deps import ToolBindingCache
+from .planner import PlannerNode
+from .compiler import CompilerNode
+from .executor import ExecutorNode
+
+logger = get_logger("converter.graph")
+
+
+Route = Literal["planner", "compiler", "executor", "__end__"]
+
+
+def _route_after_compiler(state: ConverterState) -> Route:
+    # If compiler asked for replan and we have replans left -> planner
+    if state.get("replan_needed"):
+        if int(state.get("replan_count", 0)) < int(state.get("max_replans", 0)):
+            state["replan_count"] = int(state.get("replan_count", 0)) + 1
+            return "planner"
+        return "__end__"
+    return "executor"
+
+
+def _route_after_executor(state: ConverterState) -> Route:
+    if state.get("replan_needed"):
+        if int(state.get("replan_count", 0)) < int(state.get("max_replans", 0)):
+            state["replan_count"] = int(state.get("replan_count", 0)) + 1
+            return "planner"
+        return "__end__"
+    return "__end__"
+
+
+def build_converter_subgraph(*, llm: Any, tool_manager: Any, config: ConverterConfig):
+    """
+    Builds and compiles the converter subgraph:
+      planner -> compiler -> executor
+      with loopback edges to planner on compiler/executor errors (bounded).
+    """
+    llm_cache = ToolBindingCache(llm=llm, tool_manager=tool_manager)
+
+    planner = PlannerNode(llm_cache=llm_cache, tool_manager=tool_manager, config=config)
+    compiler = CompilerNode(tool_manager=tool_manager, config=config)
+    executor = ExecutorNode(tool_manager=tool_manager, config=config)
+
+    g = StateGraph(ConverterState)
+
+    g.add_node("planner", planner)
+    g.add_node("compiler", compiler)
+    g.add_node("executor", executor)
+
+    g.add_edge(START, "planner")
+    g.add_edge("planner", "compiler")
+
+    g.add_conditional_edges(
+        "compiler",
+        _route_after_compiler,
+        {
+            "planner": "planner",
+            "executor": "executor",
+            "__end__": END,
+        },
+    )
+
+    g.add_conditional_edges(
+        "executor",
+        _route_after_executor,
+        {
+            "planner": "planner",
+            "__end__": END,
+        },
+    )
+
+    return g.compile()
+
+agentic_suite/agents/converter_agent.py
+
+from __future__ import annotations
+
+from typing import Any
+
+from agentic_logging import get_logger
+from agentic_suite.graph.state import GraphState  # your main graph state type
+from .converter.config import ConverterConfig
+from .converter.graph import build_converter_subgraph
+from .converter.state import ConverterState
+
+logger = get_logger("converter_agent")
+
+
+class ConverterAgent:
+    """
+    Main graph node wrapper around converter subgraph.
+
+    Supervisor should set:
+      state["active_task_type"] = "convert"
+      state["conversion_request"] = {...}  # preferred
+    """
+
+    def __init__(self, *, llm: Any, tool_manager: Any, config: ConverterConfig | None = None):
+        self.llm = llm
+        self.tool_manager = tool_manager
+        self.config = config or ConverterConfig()
+        self.subgraph = build_converter_subgraph(llm=self.llm, tool_manager=self.tool_manager, config=self.config)
+
+    async def __call__(self, state: GraphState) -> GraphState:
+        session_id = state.get("session_id") or state.get("thread_id") or "unknown"
+        user_id = state.get("user_id") or state.get("user") or "default_user"
+
+        conversion_request = state.get("conversion_request") or state.get("conversion_intent")
+        if not conversion_request:
+            state["conversion_result"] = {
+                "status": "FAILED",
+                "error": {"code": "MISSING_CONVERSION_REQUEST", "message": "No conversion_request in GraphState"},
+            }
+            return state
+
+        conv_state: ConverterState = {
+            "session_id": session_id,
+            "user_id": user_id,
+            "conversion_request": conversion_request,
+            "recent_chat_summary": state.get("recent_chat_summary", ""),
+            "replan_count": 0,
+            "max_replans": self.config.max_replans,
+            "replan_needed": False,
+        }
+
+        out: ConverterState = await self.subgraph.ainvoke(conv_state)
+
+        state["conversion_result"] = out.get("conversion_result", {})
+        state["last_experiment_id"] = out.get("run_id")
         return state
 
 
 
-------////
-
-# ConverterAgent V2 (Planner ReAct + Compiler + Executor)
-
-This implementation follows **Option A (state-of-the-art)**:
-
-1) **Planner (LLM, ReAct)** chooses a semantic plan using tool introspection:
-   - list_tools
-   - get_tool_spec
-   - modelhub_get_model / get_by_path (optional)
-
-2) **Compiler (deterministic)** validates and compiles the plan:
-   - resolves tool selectors to exact tool names
-   - expands policy buckets to optional args (validated against tool spec)
-   - sandboxes IO paths within workspace root
-
-3) **Executor (deterministic)** runs the compiled steps:
-   - sequential run_tool calls
-   - idempotence optional
-   - logs + artifacts + experiment status
-
-The executor never “reasons”; it only runs a compiled build plan.
-
-## Integration points
-
-You must wire:
-- ModelHub MCP tools: get_model, get_by_path
-- SNPE/QNN MCP tools: list_tools, get_tool_spec, run_tool
-- ExperimentService: create/update_status/add_artifacts
-
-You must also bind ONLY the planner tools to the planner LLM.
-
-## Files written per experiment
-- input/ (copied source model)
-- plan_ir.json
-- compiled_plan.json
-- logs/
-- converted/ (artifacts)
-
-
-
-------//
-
-You are ConverterPlanner.
-
-Goal:
-Produce a ConversionPlanIR to convert a model to the requested target runtime and SoC.
-
-Allowed tools:
-- list_tools
-- get_tool_spec
-- modelhub_get_model / modelhub_get_by_path (optional)
-
-Rules:
-- Never call run_tool.
-- Do not output CLI flags; choose high-level params and policy_bucket.
-- Use tool_selector (category/source/target/accelerator/tags) instead of hardcoding tool names.
-- Use workspace-relative IO paths only (no absolute paths, no ..).
-- If required info is missing, return NEEDS_INPUT with questions.
-
-Output:
-Return ONLY a valid ConversionPlanIR JSON object.
-
-
-
-----//
-
-
-
-
-
-# ConverterAgent
-
-ConverterAgent is a **deterministic execution sub-graph** responsible for converting deep learning models into target runtimes (SNPE / QNN / etc.) inside the *Agentic DL Workflow Suite*.
-
-It is intentionally **non-conversational**, **reproducible**, and **auditable**.
-
----
-
-## 1) What it does
-
-ConverterAgent performs:
-
-1. **Resolve model** (from ModelHub via MCP; ModelHub is read-only)
-2. **Create experiment record** (DB)
-3. **Materialize workspace** (create dirs + copy model into `input/`)
-4. **Select conversion tool** using reflective MCP registry (`list_tools`)
-5. **Resolve required args** via `get_tool_spec(view="required")` (I/O mapping only)
-6. **Apply optional args** only from explicit intent/policy (`precision`, `quantization`, etc.)
-7. **Run conversion** via MCP `run_tool`
-8. **Persist logs + artifacts** and mark experiment `COMPLETED` (or `FAILED`)
-
-ConverterAgent **does not**:
-- Participate in chat loops
-- Use chat history as context
-- Reason about CLI flags
-- Modify ModelHub
-- Perform profiling or patch-search
-
----
-
-## 2) Design principles
-
-**Execution plane vs reasoning plane**
-
-ConverterAgent lives in the **execution plane**:
-- deterministic
-- restartable
-- reproducible
-- audit-friendly
-
-Agentic “intelligence” (iteration, argument deltas, choosing next experiments) belongs outside:
-- ChatAgent / SupervisorAgent
-- future ExperimentReasonerAgent
-
-**Reflective tool registry**
-SNPE/QNN tools can have huge schemas. To avoid context bloat, the SNPE/QNN MCP server exposes:
-- `list_tools` (lightweight list, no args)
-- `get_tool_spec` (fetch required/optional args only when needed)
-- `run_tool` (execute)
-
----
-
-## 3) Inputs
-
-ConverterAgent consumes a `ConversionIntent` object.
-
-Example:
-
-```json
-{
-  "model_ref": { "type": "modelhub_id", "value": "resnet50_tf" },
-  "source_framework": "tensorflow",
-  "target_runtime": "snpe",
-  "target_soc": "sm8550",
-  "precision": "fp16",
-  "quantization": "none"
-}
-
-Notes:
-	•	No CLI flags in intent.
-	•	Only “intent-level” fields (source/target/runtime/soc/precision/quantization).
-
-⸻
-
-4) Outputs
-
-ConverterAgent returns a compact ConversionResult and writes artifacts to the workspace.
-
-Result injected back into the main graph state
-
-{
-  "experiment_id": "uuid",
-  "status": "COMPLETED",
-  "artifacts": [
-    { "type": "dlc", "path": "converted/model.dlc" }
-  ],
-  "error": null
-}
-
-Workspace layout
-
-/data/experiments/<user>/<experiment_id>/
-  ├── input/
-  │   └── <model-file>
-  ├── converted/
-  │   └── model.dlc
-  ├── logs/
-  │   ├── conversion.stdout.txt
-  │   ├── conversion.stderr.txt
-  │   ├── conversion.exec_result.json
-  │   └── failure.txt (only on error)
-  ├── metadata.json
-  └── params.json
-
-
-⸻
-
-5) Sub-graph flow (LangGraph)
-
-ConverterAgent is implemented as a LangGraph sub-graph:
-
-resolve_model
-→ create_experiment
-→ materialize_workspace
-→ select_tool
-→ resolve_tool_plan
-→ run_conversion
-→ END
-
-All failures route to:
-
-handle_failure → END
-
-
-⸻
-
-6) MCP tool expectations
-
-ModelHub (read-only)
-
-Required MCP tools:
-	•	modelhub_get_model(model_id)
-	•	modelhub_get_by_path(file_path)
-
-Expected response fields:
-	•	id
-	•	filename
-	•	absolute_path
-
-SNPE/QNN reflective registry (stateless executor)
-
-Required MCP tools:
-	•	list_tools()
-	•	get_tool_spec(tool_name, view) where view ∈ {required, optional, all}
-	•	run_tool(tool_name, args, workspace_root)
-
-list_tools() should return entries with at least:
-	•	name
-	•	category (must include "conversion")
-	•	source (e.g. tensorflow)
-	•	target (e.g. snpe)
-
-⸻
-
-7) Determinism rules (MUST)
-
-ConverterAgent MUST:
-	•	Fail if no tool matches the intent
-	•	Fail if multiple tools match the intent (ambiguity)
-	•	Only resolve required args that are clearly I/O paths
-	•	Never “guess” non-I/O required args
-	•	Never write outside the workspace root
-	•	Never modify ModelHub
-
-⸻
-
-8) Integration into main orchestrator graph
-
-ConverterAgent is plugged into the main orchestrator as a single node:
-
-START → supervisor → convert → END
-
-It does not participate in:
-	•	chat → tools → chat loop
-	•	RAG loop
-
-The main graph passes only:
-	•	conversion_intent
-	•	session_id / thread_id
-	•	user (optional)
-
-And receives:
-	•	conversion_result
-	•	last_experiment_id
-
-⸻
-
-9) Dependencies you must provide (integration points)
-
-You must supply concrete implementations (DB/MCP wrappers) for:
-	•	ModelHub client:
-	•	get_model(model_id) -> dict
-	•	get_by_path(file_path) -> dict
-	•	SNPE/QNN registry client:
-	•	list_tools() -> list[dict]
-	•	get_tool_spec(tool_name, view) -> dict
-	•	run_tool(tool_name, args, workspace_root) -> dict
-	•	Experiment service:
-	•	create(...)
-	•	update_status(experiment_id, status, error=None, extra=None)
-	•	add_artifacts(experiment_id, artifacts)
-
-⸻
-
-10) Common failure modes
-	•	Tool schema mismatch (required arg names changed)
-	•	Tool ambiguity (multiple conversion tools match)
-	•	Missing output artifact after tool run
-	•	Non-zero exit code or tool error reported in exec result
-	•	Filesystem permission / disk space issues
-
-All failures must mark the experiment as FAILED and write logs/failure.txt best-effort.
-
-⸻
 
 
